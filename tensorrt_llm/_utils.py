@@ -519,11 +519,13 @@ def get_free_ports(num=1) -> List[int]:
 OMPI_COMM_TYPE_HOST = 9
 
 comm = pkl5.Intracomm(MPI.COMM_WORLD)
+_local_comm = None
 
 
 def set_mpi_comm(new_comm):
-    global comm
+    global comm, _local_comm
     comm = new_comm
+    _local_comm = None
 
 
 thread_local_comm = threading.local()
@@ -540,11 +542,19 @@ def mpi_comm():
     return comm
 
 
-local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+def _get_local_mpi_comm():
+    global _local_comm
+    if not ENABLE_MULTI_DEVICE or mpi_disabled():
+        return None
+    if _local_comm is None:
+        if not MPI.Is_initialized():
+            return None
+        _local_comm = comm.Split_type(split_type=OMPI_COMM_TYPE_HOST)
+    return _local_comm
 
 
 def local_mpi_comm():
-    return local_comm
+    return _get_local_mpi_comm()
 
 
 # Global TorchDist instance for Ray orchestrator
@@ -609,7 +619,10 @@ def local_mpi_rank():
 
 
 def local_mpi_size():
-    return local_comm.Get_size() if ENABLE_MULTI_DEVICE else 1
+    local_mpi_comm_instance = local_mpi_comm()
+    if local_mpi_comm_instance is None:
+        return 1
+    return local_mpi_comm_instance.Get_size()
 
 
 def default_gpus_per_node():
@@ -627,8 +640,9 @@ def mpi_barrier():
 
 
 def local_mpi_barrier():
-    if ENABLE_MULTI_DEVICE:
-        local_comm.Barrier()
+    local_mpi_comm_instance = local_mpi_comm()
+    if local_mpi_comm_instance is not None:
+        local_mpi_comm_instance.Barrier()
 
 
 def mpi_broadcast(obj, root=0):

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +34,8 @@ from ._utils import (QuantModeWrapper, bf16_array, bool_array,
                      int64_array, np_dtype_to_trt, str_dtype_to_trt,
                      trt_dtype_to_np, trt_dtype_to_str)
 from .network import PluginInfo, get_np_weight, set_np_weight, set_plugin_info
-from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
+from .plugin import (_load_plugin_lib, TRT_LLM_PLUGIN_NAMESPACE,
+                     current_all_reduce_helper)
 from .quantization import QuantMode
 
 
@@ -6954,9 +6955,11 @@ def mamba_conv1d(input: Tensor,
     post_stride = trt.PluginField("post_stride",
                                   np.array(post_stride, dtype=np.int32),
                                   trt.PluginFieldType.INT32)
-    pf_type = trt.PluginField(
-        "type_id", np.array([int(str_dtype_to_trt(dtype))], np.int32),
-        trt.PluginFieldType.INT32)
+    plugin_dtype = dtype if isinstance(dtype, trt.DataType) else str_dtype_to_trt(
+        dtype)
+    pf_type = trt.PluginField("type_id", np.array([int(plugin_dtype)],
+                                                  np.int32),
+                              trt.PluginFieldType.INT32)
     remove_input_padding = trt.PluginField(
         "remove_input_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
@@ -7165,6 +7168,133 @@ def selective_scan(input: Tensor,
     else:
         present_state = _create_tensor(layer.get_output(1), layer)
         return output, present_state
+
+
+def qwen_causal_conv1d(input: Tensor, conv_state: Tensor, conv_weight: Tensor):
+    '''
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, channels].
+
+        conv_state : Tensor (On GPU)
+            The conv state tensor. Its shape is [batch_size, channels, kernel_size - 1].
+
+        conv_weight : Tensor (On GPU)
+            The depthwise weight tensor. Its shape is [channels, 1, kernel_size].
+    '''
+    qwen_conv_plg_creator = next(
+        (creator for creator in trt.get_plugin_registry().plugin_creator_list
+         if creator.name == 'QwenCausalConv1d'
+         and creator.plugin_version == '1'
+         and creator.plugin_namespace == TRT_LLM_PLUGIN_NAMESPACE), None)
+    if qwen_conv_plg_creator is None:
+        _load_plugin_lib()
+        qwen_conv_plg_creator = next(
+            (creator for creator in trt.get_plugin_registry().plugin_creator_list
+             if creator.name == 'QwenCausalConv1d'
+             and creator.plugin_version == '1'
+             and creator.plugin_namespace == TRT_LLM_PLUGIN_NAMESPACE), None)
+    assert qwen_conv_plg_creator is not None
+
+    channels = input.size(-1)
+    kernel_size = conv_weight.size(2)
+    if channels is None or kernel_size is None:
+        raise ValueError(
+            "qwen_causal_conv1d requires static channel and kernel dimensions")
+
+    plugin_dtype = input.dtype if isinstance(input.dtype,
+                                             trt.DataType) else str_dtype_to_trt(
+                                                 input.dtype)
+    pfc = trt.PluginFieldCollection([
+        trt.PluginField("dim", np.array(channels, dtype=np.int32),
+                        trt.PluginFieldType.INT32),
+        trt.PluginField("width", np.array(kernel_size, dtype=np.int32),
+                        trt.PluginFieldType.INT32),
+        trt.PluginField("type_id", np.array([int(plugin_dtype)], np.int32),
+                        trt.PluginFieldType.INT32),
+    ])
+    qwen_conv_plug = qwen_conv_plg_creator.create_plugin("qwen_causal_conv1d",
+                                                         pfc)
+
+    plug_inputs = [input, conv_state, conv_weight]
+    layer = default_trtnet().add_plugin_v2(
+        [tensor.trt_tensor for tensor in plug_inputs], qwen_conv_plug)
+    _add_plugin_info(layer, qwen_conv_plg_creator, "qwen_causal_conv1d", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    present_state = _create_tensor(layer.get_output(1), layer)
+    return output, present_state
+
+
+def gated_delta_plugin(query: Tensor,
+                       key: Tensor,
+                       value: Tensor,
+                       state: Tensor,
+                       a_log: Tensor,
+                       a: Tensor,
+                       dt_bias: Tensor,
+                       b: Tensor,
+                       host_request_types: Tensor,
+                       host_context_lengths: Tensor):
+    '''
+    Parameters:
+        query : Tensor (On GPU)
+            The raw query tensor. Its shape is [batch_size, seq_len, num_heads, key_dim].
+
+        key : Tensor (On GPU)
+            The raw key tensor. Its shape is [batch_size, seq_len, num_heads, key_dim].
+
+        value : Tensor (On GPU)
+            The value tensor. Its shape is [batch_size, seq_len, num_heads, value_dim].
+
+        state : Tensor (On GPU)
+            The recurrent state tensor. Its shape is [batch_size, num_heads, value_dim, key_dim].
+
+        a_log : Tensor (On GPU)
+            Per-head decay log weights. Its shape is [num_heads].
+
+        a : Tensor (On GPU)
+            Raw decay activations. Its shape is [batch_size, seq_len, num_heads].
+
+        dt_bias : Tensor (On GPU)
+            Per-head decay bias. Its shape is [num_heads].
+
+        b : Tensor (On GPU)
+            Raw update activations. Its shape is [batch_size, seq_len, num_heads].
+
+        host_request_types : Tensor (On CPU)
+            The tensor on the host that indicates if a request is in context or generation phase.
+
+        host_context_lengths : Tensor (On CPU)
+            Per-request context lengths used for padded context rows.
+    '''
+    gated_delta_plg_creator = next(
+        (creator for creator in trt.get_plugin_registry().plugin_creator_list
+         if creator.name == 'GatedDelta' and creator.plugin_version == '2'
+         and creator.plugin_namespace == TRT_LLM_PLUGIN_NAMESPACE), None)
+    if gated_delta_plg_creator is None:
+        _load_plugin_lib()
+        gated_delta_plg_creator = next(
+            (creator for creator in trt.get_plugin_registry().plugin_creator_list
+             if creator.name == 'GatedDelta'
+             and creator.plugin_version == '2'
+             and creator.plugin_namespace == TRT_LLM_PLUGIN_NAMESPACE), None)
+    assert gated_delta_plg_creator is not None
+
+    pfc = trt.PluginFieldCollection([])
+    gated_delta_plug = gated_delta_plg_creator.create_plugin(
+        "gated_delta", pfc)
+
+    plug_inputs = [
+        query, key, value, state, a_log, a, dt_bias, b, host_request_types,
+        host_context_lengths
+    ]
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, gated_delta_plug)
+    _add_plugin_info(layer, gated_delta_plg_creator, "gated_delta", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    present_state = _create_tensor(layer.get_output(1), layer)
+    return output, present_state
 
 
 def rg_lru(input: Tensor,

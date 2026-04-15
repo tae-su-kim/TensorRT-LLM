@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@ from typing import (Any, List, Literal, Optional, Tuple, Union, get_args,
                     get_origin)
 
 import tensorrt as trt
+from pydantic import BaseModel
 from pydantic import (ConfigDict, Field, PrivateAttr, ValidationInfo,
                       field_validator, model_validator)
 
@@ -32,9 +33,17 @@ from .._utils import get_sm_version
 from ..bindings.internal.runtime import (lamport_initialize,
                                          lamport_initialize_all,
                                          max_workspace_size_lowprecision)
-from ..llmapi.utils import StrictBaseModel
 from ..logger import logger
 from ..mapping import Mapping
+
+if os.getenv("TRT_LLM_MINIMAL_IMPORT", "0") == "1":
+
+    class StrictBaseModel(BaseModel):
+
+        class Config:
+            extra = "forbid"
+else:
+    from ..llmapi.utils import StrictBaseModel
 
 TRT_LLM_PLUGIN_NAMESPACE = 'tensorrt_llm'
 
@@ -186,6 +195,11 @@ class PluginConfig(StrictBaseModel):
         default="auto",
         description=
         "Enable some customized kernels to speed up the MoE layer of MoE models."
+    )
+    gated_delta_plugin: bool = Field(
+        default=False,
+        description=
+        "Enable the fused recurrent GatedDeltaNet plugin used by Qwen3.5."
     )
     mamba_conv1d_plugin: Optional[DefaultPluginDtype] = Field(
         default="auto",
@@ -469,6 +483,7 @@ cli_plugin_args = [
     "lora_plugin",
     "dora_plugin",
     "moe_plugin",
+    "gated_delta_plugin",
     "mamba_conv1d_plugin",
     "nccl_plugin",
     "low_latency_gemm_plugin",

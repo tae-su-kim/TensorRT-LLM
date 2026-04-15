@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
+#include "tensorrt_llm/batch_manager/directRnnStateManager.h"
 #include "tensorrt_llm/batch_manager/guidedDecoder.h"
 #include "tensorrt_llm/batch_manager/handleContextLogits.h"
 #include "tensorrt_llm/batch_manager/handleGenerationLogits.h"
@@ -200,8 +201,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     if (!(mModelConfig.supportsInflightBatching()))
     {
         throw std::runtime_error(
-            "TrtGptModelInflightBatching requires GPT attention/Mamba Conv 1d plugin with "
-            "packed input and paged KV cache.");
+            "TrtGptModelInflightBatching requires either a supported transformer engine or a supported recurrent "
+            "engine runtime contract.");
     }
     if (mWorldConfig.isTensorParallel())
     {
@@ -297,9 +298,13 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         mPeftCacheManager = std::make_shared<NoOpPeftCacheManager>();
     }
 
-    if (mModelConfig.isRnnBased())
+    if (mModelConfig.usesPagedRecurrentState())
     {
         createRnnStateManager();
+    }
+    else if (mModelConfig.usesDirectRecurrentState())
+    {
+        createDirectRnnStateManager();
     }
     if (mModelConfig.isTransformerBased() && modelConfig.isKVCacheEnabled())
     {
@@ -552,12 +557,14 @@ void TrtGptModelInflightBatching::reshapeKvTensors(OffsetTableDimensions const& 
 {
     TLLM_CHECK(mBuffers.size() == static_cast<size_t>(mNumBuffers));
     auto const& manager = mRuntime->getBufferManager();
-    for (auto& buffers : mBuffers)
+    for (std::size_t bufferIdx = 0; bufferIdx < mBuffers.size(); ++bufferIdx)
     {
+        auto& buffers = mBuffers[bufferIdx];
         TLLM_CHECK(buffers->transformerBuffers);
+        auto* transformerBuffers = buffers->transformerBuffers.get();
         // any method that operates on transformerBuffers must distinguish between self and cross cache, because
         // transformerBuffers is not managed by KVCacheManager same rule applies to kv pool pointers below
-        buffers->transformerBuffers->reshapeKvTensors(
+        transformerBuffers->reshapeKvTensors(
             getMaxBatchSize(), mOperatingBeamWidth, dims.maxBlocksPerSeq, dims.cacheType, dims.numPools, manager);
     }
 }
@@ -699,11 +706,24 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
             : nullptr,
         kvCacheConfig.getEnablePartialReuse(), kvCacheConfig.getCopyOnPartialReuse());
 
-    reshapeKvTensors(kvCacheManager->getOffsetTableDimensions());
+    TLLM_LOG_TRACE("createKvCacheManager: reshaping KV tensors");
+    auto const dims = kvCacheManager->getOffsetTableDimensions();
+    TLLM_CHECK(mBuffers.size() == static_cast<size_t>(mNumBuffers));
+    auto const& manager = mRuntime->getBufferManager();
+    for (std::size_t bufferIdx = 0; bufferIdx < mBuffers.size(); ++bufferIdx)
+    {
+        auto& buffers = mBuffers[bufferIdx];
+        TLLM_CHECK(buffers->transformerBuffers);
+        auto* transformerBuffers = buffers->transformerBuffers.get();
+        transformerBuffers->reshapeKvTensors(
+            getMaxBatchSize(), mOperatingBeamWidth, dims.maxBlocksPerSeq, dims.cacheType, dims.numPools, manager);
+    }
 
+    TLLM_LOG_TRACE("createKvCacheManager: allocating KV pools");
     kvCacheManager->allocatePools(kvCacheConfig.getUseUvm());
 
     TensorMap inputBuffers;
+    TLLM_LOG_TRACE("createKvCacheManager: fetching KV pool pointers");
     TensorPtr poolPointers = kvCacheManager->getBlockPoolPointers();
     TensorPtr poolMapping = kvCacheManager->getLayerToPoolMapping();
 
@@ -717,20 +737,38 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
         inputBuffers.insert_or_assign("host_cross_kv_cache_pool_pointers", std::move(poolPointers));
         inputBuffers.insert_or_assign("host_cross_kv_cache_pool_mapping", std::move(poolMapping));
     }
+    TLLM_LOG_TRACE("createKvCacheManager: registering static KV inputs");
     mRuntime->setStaticInputTensors(inputBuffers);
 
-    // Emit the `created` event
-    kvCacheManager->flushIterationEvents();
+    if (kvCacheConfig.getEventBufferMaxSize() > 0)
+    {
+        TLLM_LOG_TRACE("createKvCacheManager: flushing initial KV events");
+        kvCacheManager->flushIterationEvents();
+    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return kvCacheManager;
+}
+
+void TrtGptModelInflightBatching::createDirectRnnStateManager()
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    TLLM_CHECK_WITH_INFO(
+        mModelConfig.usesDirectRecurrentState(), "DirectRnnStateManager is only needed by direct recurrent models.");
+
+    mDirectRnnStateManager = std::make_unique<DirectRnnStateManager>(
+        getMaxNumSequences(), mModelConfig, mWorldConfig, *mRuntime);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void TrtGptModelInflightBatching::createRnnStateManager()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    TLLM_CHECK_WITH_INFO(mModelConfig.isRnnBased(), "RnnStateManager is only needed by RNN based model.");
+    TLLM_CHECK_WITH_INFO(mModelConfig.usesPagedRecurrentState(),
+        "RnnStateManager is only needed by paged recurrent-state models.");
 
     mRnnStateManager = std::make_unique<RnnStateManager>(
         getMaxNumSequences(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
@@ -1547,7 +1585,6 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
                 getMaxAttentionWindow(), getSinkTokenLen(), *mRuntime, mModelConfig, mWorldConfig, decodingConfig,
                 getGatherGenerationLogits(), getMaxNumTokens(), additionalModelOutputs, mPromptTableOffloading));
     }
-
     mDecoderInputBuffers.clear();
     mDecoderOutputBuffers.clear();
     for (SizeType32 i = 0; i < mNumMicroBatches; ++i)
@@ -1684,8 +1721,8 @@ void TrtGptModelInflightBatching::prepareDistGenBufferAndDecoder(RequestVector c
         auto& runtimeBuffers = *mBuffers[bufferId];
         runtimeBuffers.prepareStep(cacheTransCompleteRequests, {}, getMaxBeamWidth(), getMaxAttentionWindow(),
             *mDecoderState, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
-            mPeftTables[mMicroBatchId], *mRuntime, mModelConfig, mWorldConfig, getGatherGenerationLogits(),
-            isTrtOverlap());
+            mDirectRnnStateManager.get(), mPeftTables[mMicroBatchId], *mRuntime, mModelConfig, mWorldConfig,
+            getGatherGenerationLogits(), isTrtOverlap());
         auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
         setupDecoderStep(
             cacheTransCompleteRequests, *mBuffers.at(contextBufferId), mDecoderInputBuffers.at(getFusedBufferId()));
@@ -1749,8 +1786,8 @@ TrtGptModelInflightBatching::prepareBuffers(
 
     auto [optProfileId, inputMap, outputMap] = runtimeBuffers.prepareStep(contextRequests, generationRequests,
         mOperatingBeamWidth, getMaxAttentionWindow(), *mDecoderState, mKvCacheManager.get(), mCrossKvCacheManager.get(),
-        mRnnStateManager.get(), mPeftTables[bufferId], *mRuntime, mModelConfig, mWorldConfig,
-        getGatherGenerationLogits(), isTrtOverlap(), allNewTokens);
+        mRnnStateManager.get(), mDirectRnnStateManager.get(), mPeftTables[bufferId], *mRuntime, mModelConfig,
+        mWorldConfig, getGatherGenerationLogits(), isTrtOverlap(), allNewTokens);
 
     // For Variable-Beam-Width-Search
     mRuntime->setCurrentBeamWidths(
@@ -1839,6 +1876,11 @@ void TrtGptModelInflightBatching::executeStep(
     }
 
     executeContext(optProfileId, bufferId);
+
+    if (mDirectRnnStateManager)
+    {
+        mBuffers[bufferId]->commitDirectRnnStateOutputs(mDirectRnnStateManager.get(), *mRuntime);
+    }
 
     // If batch state has any context request, do not capture this graph.
     if (isCudaGraphMode() && contextRequests.empty())

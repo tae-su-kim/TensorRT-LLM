@@ -30,7 +30,8 @@ from ..functional import (
     allgather, arange, bert_attention, cast, clip, concat, constant, embedding,
     expand, expand_dims, expand_mask, generate_alibi_biases, identity,
     generate_alibi_slopes, generate_logn_scaling, gpt_attention, matmul,
-    minimum, repeat_interleave, shape, slice, softmax, split, unsqueeze, where)
+    minimum, repeat_interleave, shape, sigmoid, slice, softmax, split,
+    unsqueeze, where)
 # isort: on
 from ..mapping import Mapping
 from ..module import Module, ModuleList
@@ -403,6 +404,7 @@ class Attention(Module):
                  cp_rank=0,
                  max_seqlen_for_logn_scaling=8192,
                  use_logn_scaling=False,
+                 attn_output_gate=False,
                  is_local=False):
         super().__init__()
 
@@ -419,6 +421,7 @@ class Attention(Module):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else self.num_attention_heads
         self.hidden_size = hidden_size
         self.attention_hidden_size = self.attention_head_size * self.num_attention_heads
+        self.attn_output_gate = attn_output_gate
         self.max_position_embeddings = max_position_embeddings
         self.original_max_position_embeddings = original_max_position_embeddings
         self.bias = bias
@@ -512,9 +515,12 @@ class Attention(Module):
         # out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size
         # example: d_model != num_heads * head_size in Flan-T5/ByT5/Gemma
         if enable_qkv:
+            q_hidden_size = tp_size * self.num_attention_heads * self.attention_head_size
+            if self.attn_output_gate:
+                q_hidden_size *= 2
             self.qkv = ColumnLinear(
                 hidden_size,
-                tp_size * self.num_attention_heads * self.attention_head_size +
+                q_hidden_size +
                 (2 * tp_size * self.num_attention_kv_heads *
                  self.attention_head_size),
                 bias=bias,
@@ -911,41 +917,65 @@ class Attention(Module):
                 qkv = qkv + qkv_lora
                 if self.qkv_dora is not None:
                     qkv = self.qkv_dora(qkv, qkv_lora_runtime_params)
-        if self.qk_layernorm:
-            base_shape = shape(qkv, 0) if qkv.ndim() == 2 else concat(
-                [shape(qkv, 0), shape(qkv, 1)])
+        gate = None
+        if self.qk_layernorm or self.attn_output_gate:
+            kv_size = self.attention_head_size * self.num_attention_kv_heads
             qkv_sections = [
-                self.num_attention_heads, self.num_attention_kv_heads,
-                self.num_attention_kv_heads
+                self.attention_hidden_size * (2 if self.attn_output_gate else 1),
+                kv_size,
+                kv_size,
             ]
-            total_heads = sum(qkv_sections)
-            if self.num_attention_heads != self.num_attention_kv_heads:
-                qkv = qkv.view(
-                    concat([base_shape, total_heads, self.attention_head_size]))
-                query, key, value = split(qkv, qkv_sections, dim=qkv.ndim() - 2)
+
+            if unfuse_qkv_gemm:
+                query, key, value = qkv
             else:
-                qkv = qkv.view(
-                    concat([
-                        base_shape, self.num_attention_heads, 3,
-                        self.attention_head_size
-                    ]))
-                query, key, value = split(qkv, 1, dim=qkv.ndim() - 2)
-                q_shape = concat([
-                    base_shape, self.num_attention_heads,
+                query, key, value = split(qkv, qkv_sections, dim=qkv.ndim() - 1)
+
+            base_shape = shape(query, 0) if query.ndim() == 2 else concat(
+                [shape(query, 0), shape(query, 1)])
+            query_shape = concat([
+                base_shape, self.num_attention_heads, self.attention_head_size
+            ])
+            kv_shape = concat([
+                base_shape, self.num_attention_kv_heads,
+                self.attention_head_size
+            ])
+
+            if self.attn_output_gate:
+                q_gate_shape = concat([
+                    base_shape, self.num_attention_heads, 2,
                     self.attention_head_size
                 ])
-                query = query.view(q_shape)
-                key = key.view(q_shape)
-                value = value.view(q_shape)
+                query = query.view(q_gate_shape)
+                query, gate = split(query, 1, dim=query.ndim() - 2)
+                query = query.view(query_shape)
+                gate = gate.view(query_shape)
+            else:
+                query = query.view(query_shape)
 
-            normalized_shape = None
-            if not self.layernorm_share:
-                normalized_shape = self.attention_head_size
-            query = self.q_layernorm(query, normalized_shape=normalized_shape)
-            key = self.k_layernorm(key, normalized_shape=normalized_shape)
-            qkv = concat([query, key, value], dim=query.ndim() - 2)
-            qkv = qkv.view(
-                concat([base_shape, total_heads * self.attention_head_size]))
+            key = key.view(kv_shape)
+            value = value.view(kv_shape)
+
+            if self.qk_layernorm:
+                normalized_shape = None
+                if not self.layernorm_share:
+                    normalized_shape = self.attention_head_size
+                query = self.q_layernorm(query,
+                                         normalized_shape=normalized_shape)
+                key = self.k_layernorm(key, normalized_shape=normalized_shape)
+
+            query = query.view(concat([base_shape, self.attention_hidden_size]))
+            key = key.view(concat([base_shape, kv_size]))
+            value = value.view(concat([base_shape, kv_size]))
+
+            if gate is not None:
+                gate = gate.view(
+                    concat([base_shape, self.attention_hidden_size]))
+
+            if unfuse_qkv_gemm:
+                qkv = [query, key, value]
+            else:
+                qkv = concat([query, key, value], dim=query.ndim() - 1)
         if self.position_embedding_type == PositionEmbeddingType.chatglm:
             qkv = RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm(
                 qkv,
@@ -1584,6 +1614,9 @@ class Attention(Module):
             dense_conditional = Conditional(skip_attn)
             skip_case = dense_conditional.add_input(attention_input)
             context = dense_conditional.add_input(context)
+
+        if gate is not None:
+            context = context * sigmoid(gate)
 
         if self.inner_layernorm is not None:
             context = self.inner_layernorm(context)

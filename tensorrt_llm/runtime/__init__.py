@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@ import sys
 from contextlib import contextmanager
 from typing import Iterator
 
+_minimal_import = os.getenv("TRT_LLM_MINIMAL_IMPORT", "0") == "1"
 
 # Duplicated from kv_cache_manager_v2._utils. We need this both inside and outside of
 # kv_cache_manager_v2 due to restriction of mypyc build process.
@@ -32,53 +33,59 @@ def temporary_sys_path(path: str) -> Iterator[None]:
             sys.path.remove(path)
 
 
-# Add current directory to sys.path so kv_cache_manager_v2 can be imported as top-level package.
-# This is required because when kv_cache_manager_v2 is compiled with mypyc, it is compiled as
-# a top-level package (to avoid complex build paths), but at runtime it is used as a submodule.
-# The compiled extension might try to import its submodules using absolute imports based on its
-# compiled name.
-with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
-    import kv_cache_manager_v2
-
-from .enc_dec_model_runner import EncDecModelRunner
-from .generation import SamplingConfig  # autoflake: skip
-from .generation import (ChatGLMGenerationSession, GenerationSession,
-                         LogitsProcessor, LogitsProcessorList, ModelConfig,
-                         QWenForCausalLMGenerationSession, StoppingCriteria,
-                         StoppingCriteriaList, decode_words_list)
-from .kv_cache_manager import GenerationSequence, KVCacheManager
-from .model_runner import ModelRunner
-from .multimodal_model_runner import MultimodalModelRunner
-from .session import Session, TensorInfo
-
-try:
-    import tensorrt_llm.bindings  # NOQA
-    PYTHON_BINDINGS = True
-except ImportError:
+if _minimal_import:
     PYTHON_BINDINGS = False
+    __all__ = ['PYTHON_BINDINGS']
+else:
+    from .session import Session, TensorInfo
 
-if PYTHON_BINDINGS:
-    from .model_runner_cpp import ModelRunnerCpp
+    # Add current directory to sys.path so kv_cache_manager_v2 can be imported as top-level
+    # package. This is required because when kv_cache_manager_v2 is compiled with mypyc, it is
+    # compiled as a top-level package (to avoid complex build paths), but at runtime it is used
+    # as a submodule. The compiled extension might try to import its submodules using absolute
+    # imports based on its compiled name.
+    with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
+        import kv_cache_manager_v2
 
-__all__ = [
-    'ModelConfig',
-    'GenerationSession',
-    'GenerationSequence',
-    'KVCacheManager',
-    'SamplingConfig',
-    'Session',
-    'TensorInfo',
-    'ChatGLMGenerationSession',
-    'QWenForCausalLMGenerationSession',
-    'decode_words_list',
-    'LogitsProcessorList',
-    'LogitsProcessor',
-    'StoppingCriteriaList',
-    'StoppingCriteria',
-    'ModelRunner',
-    'ModelRunnerCpp',
-    'EncDecModelRunner',
-    'MultimodalModelRunner',
-    'PYTHON_BINDINGS',
-    'kv_cache_manager_v2',
-]
+    from .enc_dec_model_runner import EncDecModelRunner
+    from .generation import SamplingConfig  # autoflake: skip
+    from .generation import (ChatGLMGenerationSession, GenerationSession,
+                             LogitsProcessor, LogitsProcessorList, ModelConfig,
+                             QWenForCausalLMGenerationSession,
+                             StoppingCriteria, StoppingCriteriaList,
+                             decode_words_list)
+    from .kv_cache_manager import GenerationSequence, KVCacheManager
+    from .model_runner import ModelRunner
+    from .multimodal_model_runner import MultimodalModelRunner
+
+    try:
+        import tensorrt_llm.bindings  # NOQA
+        PYTHON_BINDINGS = True
+    except ImportError:
+        PYTHON_BINDINGS = False
+
+    if PYTHON_BINDINGS:
+        from .model_runner_cpp import ModelRunnerCpp
+
+    __all__ = [
+        'ModelConfig',
+        'GenerationSession',
+        'GenerationSequence',
+        'KVCacheManager',
+        'SamplingConfig',
+        'Session',
+        'TensorInfo',
+        'ChatGLMGenerationSession',
+        'QWenForCausalLMGenerationSession',
+        'decode_words_list',
+        'LogitsProcessorList',
+        'LogitsProcessor',
+        'StoppingCriteriaList',
+        'StoppingCriteria',
+        'ModelRunner',
+        'ModelRunnerCpp',
+        'EncDecModelRunner',
+        'MultimodalModelRunner',
+        'PYTHON_BINDINGS',
+        'kv_cache_manager_v2',
+    ]

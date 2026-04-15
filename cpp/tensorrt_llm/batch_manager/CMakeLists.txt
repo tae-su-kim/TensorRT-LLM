@@ -32,6 +32,8 @@ set(SRCS
     contextProgress.cpp
     dataTransceiver.cpp
     decoderBuffers.cpp
+    directRnnStateBuffers.cpp
+    directRnnStateManager.cpp
     encoderBuffers.cpp
     guidedDecoder.cpp
     handleContextLogits.cpp

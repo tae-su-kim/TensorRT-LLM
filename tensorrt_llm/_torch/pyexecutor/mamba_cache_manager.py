@@ -173,16 +173,22 @@ class PythonMambaCacheManager(BaseResourceManager):
         temporal: torch.Tensor
 
         def at_layer_idx(self, layer: int):
-            kwargs = {}
-            for k, v in vars(self).items():
-                kwargs[k] = v[layer]
-            return type(self)(**kwargs)
+            return type(self)(conv=self.conv[layer],
+                              temporal=self.temporal[layer])
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
         """Speculative state with intermediate states for draft tokens."""
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: torch.Tensor
+
+        def at_layer_idx(self, layer: int):
+            return type(self)(
+                conv=self.conv[layer],
+                temporal=self.temporal[layer],
+                intermediate_ssm=self.intermediate_ssm[layer],
+                intermediate_conv_window=self.intermediate_conv_window[layer],
+            )
 
     def __init__(
         self,

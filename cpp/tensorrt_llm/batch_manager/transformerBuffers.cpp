@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -313,12 +313,38 @@ void TransformerBuffers::getBuffers(
 }
 
 void TransformerBuffers::copyPositionIds(runtime::TllmRuntime const& runtime,
-    std::vector<SizeType32> const& positionIdsHost, bool isChatGlm, TensorPtr const& decoderPositionIds)
+    std::vector<SizeType32> const& positionIdsHost, bool isChatGlm, TensorPtr const& decoderPositionIds,
+    bool nonPackedInput, SizeType32 numSequences, SizeType32 maxInputLengthInBatch)
 {
     auto const& manager = runtime.getBufferManager();
     if (isChatGlm)
     {
         positionIds->reshape(ITensor::makeShape({2, static_cast<int>(positionIdsHost.size()) / 2}));
+        manager.copy(positionIdsHost.data(), *positionIds);
+    }
+    else if (nonPackedInput)
+    {
+        TLLM_CHECK_WITH_INFO(
+            numSequences > 0 && maxInputLengthInBatch > 0, "Non-packed position ids require 2D shape metadata.");
+        auto const& engine = runtime.getEngine();
+        auto expectsSingletonTrailingDim = true;
+        for (auto profileIdx = 0; profileIdx < engine.getNbOptimizationProfiles(); ++profileIdx)
+        {
+            auto const maxShape
+                = engine.getProfileShape(kPositionIdsTensorName, profileIdx, nvinfer1::OptProfileSelector::kMAX);
+            if (maxShape.nbDims < 2 || maxShape.d[maxShape.nbDims - 1] != 1)
+            {
+                expectsSingletonTrailingDim = false;
+                break;
+            }
+        }
+        if (expectsSingletonTrailingDim)
+        {
+            positionIds->reshape(ITensor::makeShape({numSequences, 1}));
+            manager.setZero(*positionIds);
+            return;
+        }
+        positionIds->reshape(ITensor::makeShape({numSequences, maxInputLengthInBatch}));
         manager.copy(positionIdsHost.data(), *positionIds);
     }
     else if (decoderPositionIds == nullptr)

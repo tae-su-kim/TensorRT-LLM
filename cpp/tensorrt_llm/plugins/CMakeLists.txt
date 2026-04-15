@@ -70,6 +70,8 @@ set(PLUGIN_LISTS
     loraPlugin
     doraPlugin
     mixtureOfExperts
+    gatedDeltaPlugin
+    qwenCausalConv1dPlugin
     selectiveScanPlugin
     mambaConv1dPlugin
     lruPlugin

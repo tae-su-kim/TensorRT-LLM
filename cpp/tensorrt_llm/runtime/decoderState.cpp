@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -105,6 +105,7 @@ void DecoderState::setupBuffers(nvinfer1::DataType dtype, BufferManager const& b
     dInput->badWordsPtrs = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<int32_t*>::value);
     dInput->badWordsLens = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType);
     dInput->embeddingBias = bufferManager.emptyTensor(MemoryType::kGPU, dtype);
+    dInput->embeddingBiasMask = bufferManager.emptyTensor(MemoryType::kCPU, TRTDataType<bool>::value);
 
     mBeamSearchBuffers = std::make_unique<BeamSearchBuffers>(bufferManager);
 
@@ -288,6 +289,7 @@ void DecoderState::reshapeBuffers(SizeType32 maxNumSequences, SizeType32 maxBeam
 
     const_cast<ITensor&>(*dInput.embeddingBias)
         .reshape(ITensor::makeShape({mMaxNumSequences, static_cast<SizeType32>(vocabSizePadded)}));
+    const_cast<ITensor&>(*dInput.embeddingBiasMask).reshape(maxNumSequencesShape);
     const_cast<ITensor&>(*dInput.badWordsPtrs).reshape(maxNumSequencesShape);
     const_cast<ITensor&>(*dInput.badWordsLens).reshape(maxNumSequencesShape);
     const_cast<ITensor&>(*dInput.stopWordsPtrs).reshape(maxNumSequencesShape);

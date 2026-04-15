@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -17,9 +17,17 @@
 
 add_subdirectory(cutlass_kernels)
 add_subdirectory(cuteDslKernels)
-add_subdirectory(flashMLA)
-add_subdirectory(contextFusedMultiHeadAttention)
-add_subdirectory(decoderMaskedMultiheadAttention)
+if(BUILD_FLASH_MLA)
+  add_subdirectory(flashMLA)
+endif()
+
+if(BUILD_CONTEXT_FMHA)
+  add_subdirectory(contextFusedMultiHeadAttention)
+endif()
+
+if(BUILD_DECODER_ATTENTION)
+  add_subdirectory(decoderMaskedMultiheadAttention)
+endif()
 add_subdirectory(selectiveScan)
 add_subdirectory(userbuffers)
 add_subdirectory(trtllmGenKernels)
@@ -30,6 +38,8 @@ add_subdirectory(dsv3MinLatencyKernels)
 add_subdirectory(causalConv1d)
 add_subdirectory(fusedGatedRMSNormQuant)
 add_subdirectory(mamba2MTPSSMCache)
+add_subdirectory(flashInferGatedDeltaPrefill)
+add_subdirectory(flashInferGatedDeltaDecode)
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
@@ -38,6 +48,10 @@ file(GLOB_RECURSE SRC_CU *.cu)
 # selectiveScan trtllmGenKernels folder
 list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "cutlass_kernels/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "flashInferGatedDeltaDecode/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "flashInferGatedDeltaDecode/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "flashInferGatedDeltaPrefill/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "flashInferGatedDeltaPrefill/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "cuteDslKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "cuteDslKernels/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "flashMLA/.*")
@@ -81,5 +95,6 @@ target_include_directories(
   PUBLIC
     $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
 )
-target_link_libraries(kernels_src PUBLIC trtllm_gen_fmha_interface)
+target_link_libraries(kernels_src PUBLIC trtllm_gen_fmha_interface flashinfer_gdn_prefill_src
+                                         flashinfer_gdn_decode_src)
 add_cuda_architectures(kernels_src 89)

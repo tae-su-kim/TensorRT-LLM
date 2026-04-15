@@ -33,6 +33,13 @@ _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
 
 
+@functools.lru_cache(maxsize=1)
+def _thop_attention_supports_context_kwargs() -> bool:
+    """Detect whether the installed thop attention binding accepts ctx kwargs."""
+    signature = thop.attention.__doc__ or ""
+    return "num_contexts" in signature and "num_ctx_tokens" in signature
+
+
 @dataclass(kw_only=True, init=False)
 class TrtllmAttentionWrapper:
     sequence_length: torch.Tensor
@@ -659,7 +666,7 @@ class TrtllmAttentionWrapper:
                 global_layer_idx=self.global_layer_idx,
             )
         else:
-            thop.attention(
+            attention_args = (
                 q,
                 k,
                 v,
@@ -740,9 +747,15 @@ class TrtllmAttentionWrapper:
                 quant_q_buffer,
                 self.flash_mla_tile_scheduler_metadata,
                 self.flash_mla_num_splits,
-                num_contexts=num_contexts,
-                num_ctx_tokens=num_ctx_tokens,
             )
+            if _thop_attention_supports_context_kwargs():
+                thop.attention(
+                    *attention_args,
+                    num_contexts=num_contexts,
+                    num_ctx_tokens=num_ctx_tokens,
+                )
+            else:
+                thop.attention(*attention_args)
 
         if self.print_skip_softmax_stat:
             (total_blocks, skipped_blocks) = self.skip_softmax_stat

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -71,6 +71,7 @@ struct OffsetTableDimensions;
 
 namespace rnn_state_manager
 {
+class DirectRnnStateManager;
 class RnnStateManager;
 } // namespace rnn_state_manager
 
@@ -118,6 +119,7 @@ class TrtGptModelInflightBatching : public TrtGptModel
     using KVCacheManager = kv_cache_manager::KVCacheManager;
     using KvCacheType = kv_cache_manager::CacheType;
     using KvCacheConfig = executor::KvCacheConfig;
+    using DirectRnnStateManager = rnn_state_manager::DirectRnnStateManager;
     using RnnStateManager = rnn_state_manager::RnnStateManager;
     using LlmRequestPtr = std::shared_ptr<batch_manager::LlmRequest>;
 
@@ -299,6 +301,7 @@ private:
     std::unique_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType,
         uint64_t freePrimaryMemBytes, uint64_t freeSecondaryMemBytes, size_t extraCostMemory,
         bool const failFastOnAttentionWindowTooLarge = false);
+    void createDirectRnnStateManager();
     void createRnnStateManager();
     void createCustomAllReduceWorkspace();
     void createRuntimePerfKnobsTensor(executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
@@ -574,6 +577,8 @@ private:
     std::vector<std::unique_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
     // PEFT table for each micro batch
     std::vector<PeftTable> mPeftTables;
+    // Direct recurrent-state manager for hybrid recurrent engines.
+    std::unique_ptr<DirectRnnStateManager> mDirectRnnStateManager;
 
     /******************** Book keeping ********************/
     // List of requests in each micro batch

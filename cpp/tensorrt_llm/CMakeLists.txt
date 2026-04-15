@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -78,7 +78,10 @@ if(ENABLE_NVSHMEM)
   include_directories(/usr/include/nvshmem/)
 endif()
 
-if(NOT WIN32)
+set(DECODER_SHARED_TARGET_0 "")
+set(DECODER_SHARED_TARGET_1 "")
+
+if(NOT WIN32 AND BUILD_DECODER_ATTENTION)
   set(DECODER_SHARED_TARGET_0 decoder_attention_0)
   set(DECODER_SHARED_TARGET_1 decoder_attention_1)
 endif()
@@ -179,10 +182,6 @@ set(TRTLLM_LINK_LIBS
     ${TRT_LIB}
     common_src
     kernels_src
-    flash_mla_src
-    context_attention_src
-    decoder_attention_src
-    trtllm_gen_fmha
     trtllm_gen_fp8_block_scale_moe
     trtllm_gen_gemm
     trtllm_gen_gemm_gated_act
@@ -200,9 +199,25 @@ set(TRTLLM_LINK_LIBS
     layers_src
     runtime_src
     testing_src
-    userbuffers_src
-    ${DECODER_SHARED_TARGET_0}
-    ${DECODER_SHARED_TARGET_1})
+    userbuffers_src)
+
+if(BUILD_FLASH_MLA)
+  list(APPEND TRTLLM_LINK_LIBS flash_mla_src)
+endif()
+
+if(BUILD_CONTEXT_FMHA)
+  list(APPEND TRTLLM_LINK_LIBS context_attention_src trtllm_gen_fmha)
+endif()
+
+if(BUILD_DECODER_ATTENTION)
+  list(APPEND TRTLLM_LINK_LIBS decoder_attention_src)
+  if(DECODER_SHARED_TARGET_0)
+    list(APPEND TRTLLM_LINK_LIBS ${DECODER_SHARED_TARGET_0})
+  endif()
+  if(DECODER_SHARED_TARGET_1)
+    list(APPEND TRTLLM_LINK_LIBS ${DECODER_SHARED_TARGET_1})
+  endif()
+endif()
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} low_latency_gemm_src)
   message(STATUS "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")

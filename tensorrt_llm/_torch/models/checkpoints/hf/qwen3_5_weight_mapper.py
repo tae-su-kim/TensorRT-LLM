@@ -46,6 +46,8 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
 
     _SPLIT_PROJ_PATTERN = re.compile(r"^(.*\.linear_attn)\.in_proj_(qkv|q|k|v|z|b|a)\.(.+)$")
     _SUPPORTED_SUFFIXES = {"weight", "bias", "weight_scale_inv"}
+    _DENSE_MLP_PATTERN = re.compile(
+        r"^(model\.layers\.\d+\.mlp)\.(gate_proj|up_proj|down_proj)(\..+)$")
 
     def _normalize_weight_names(self, weights: dict) -> dict:
         normalized_weights = {}
@@ -56,6 +58,18 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 key = "model." + key[len("model.language_model.") :]
             normalized_weights[key] = tensor
         return normalized_weights
+
+    def filter_weights(self, prefix: str, weights: dict) -> dict:
+        result = super().filter_weights(prefix, weights)
+        if result:
+            return result
+
+        if ((getattr(self.config.pretrained_config, "num_experts", 0) or 0) > 0
+                or ".mlp.mlp." not in prefix):
+            return result
+
+        dense_prefix = prefix.replace(".mlp.mlp.", ".mlp.", 1)
+        return super().filter_weights(dense_prefix, weights)
 
     def handle_special_instance_module(
         self,
@@ -263,8 +277,31 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
 
         return packed_weights
 
+    def _expand_dense_mlp_namespace(self, weights: dict) -> dict:
+        """Match dense Qwen3.5 MLP checkpoints to the adapter-backed module tree.
+
+        Dense Qwen3.5 layers wrap ``GatedMLP`` inside ``_DenseMlpAdapter``.
+        The resulting TRT-LLM module path is ``model.layers.N.mlp.mlp.*``,
+        while HF checkpoints store dense tensors at ``model.layers.N.mlp.*``.
+        Expand the dense namespace after MTP remapping so the generic loader can
+        still resolve ``gate_up_proj`` and ``down_proj`` through the inner MLP.
+        """
+        if (getattr(self.config.pretrained_config, "num_experts", 0) or 0) > 0:
+            return weights
+
+        remapped_weights = {}
+        for name, tensor in weights.items():
+            match = self._DENSE_MLP_PATTERN.match(name)
+            if match is None:
+                remapped_weights[name] = tensor
+                continue
+            prefix, proj_name, suffix = match.groups()
+            remapped_weights[f"{prefix}.mlp.{proj_name}{suffix}"] = tensor
+        return remapped_weights
+
     def preprocess_weights(self, weights: dict) -> dict:
         normalized_weights = self._normalize_weight_names(weights)
         packed_weights = self._pack_split_projections(normalized_weights)
         packed_weights = self._dequantize_linear_attn_fp8_qkvz(packed_weights)
-        return super().preprocess_weights(packed_weights)
+        packed_weights = super().preprocess_weights(packed_weights)
+        return self._expand_dense_mlp_namespace(packed_weights)

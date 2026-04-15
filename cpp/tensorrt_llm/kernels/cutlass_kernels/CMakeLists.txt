@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -28,16 +28,10 @@ if(NOT Python3_EXECUTABLE)
 endif()
 
 set(cutlass_source_dir ${CMAKE_BINARY_DIR}/_deps/cutlass-src)
-execute_process(
-  WORKING_DIRECTORY ${cutlass_source_dir}/python/
-  COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user
-  RESULT_VARIABLE _CUTLASS_LIBRARY_SUCCESS)
-
-if(NOT _CUTLASS_LIBRARY_SUCCESS EQUAL 0)
-  message(
-    FATAL_ERROR
-      "Failed to set up the CUTLASS library in ${cutlass_source_dir} due to"
-      " ${_CUTLASS_LIBRARY_SUCCESS}.")
+set(cutlass_python_dir ${cutlass_source_dir}/python)
+set(cutlass_python_path ${cutlass_python_dir})
+if(DEFINED ENV{PYTHONPATH} AND NOT "$ENV{PYTHONPATH}" STREQUAL "")
+  string(APPEND cutlass_python_path ":$ENV{PYTHONPATH}")
 endif()
 
 set(GENERATE_KERNELS_SCRIPT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/python)
@@ -50,7 +44,8 @@ set(INSTANTIATION_GENERATION_DIR
 
 execute_process(
   WORKING_DIRECTORY ${GENERATE_KERNELS_SCRIPT_DIR}
-  COMMAND ${Python3_EXECUTABLE} generate_kernels.py -a
+  COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${cutlass_python_path}"
+          ${Python3_EXECUTABLE} generate_kernels.py -a
           "${CMAKE_CUDA_ARCHITECTURES_ORIG}" -o ${INSTANTIATION_GENERATION_DIR}
   RESULT_VARIABLE _KERNEL_GEN_SUCCESS)
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -136,6 +136,20 @@ void PenaltyLayer<T>::allocateBuffer()
 
     auto const logitsPtrDeviceDesc = std::make_pair(batchSizeShape, TRTDataType<T*>::value);
     mWorkspaceSize = DecodingLayerWorkspace::calculateRequiredWorkspaceSize(logitsPtrDeviceDesc);
+
+    auto* temperatures = bufferCast<float>(*mTemperature);
+    auto* repetitionPenalties = bufferCast<float>(*mRepetitionPenalty);
+    auto* presencePenalties = bufferCast<float>(*mPresencePenalty);
+    auto* frequencyPenalties = bufferCast<float>(*mFrequencyPenalty);
+    auto* minLengths = bufferCast<SizeType32>(*mMinLength);
+    auto* promptIgnoreLengths = bufferCast<SizeType32>(*mPromptIgnoreLength);
+    std::fill_n(temperatures, mDecoderDomain.getBatchSize(), DefaultDecodingParams::getTemperature());
+    std::fill_n(repetitionPenalties, mDecoderDomain.getBatchSize(), DefaultDecodingParams::getRepetitionPenalty());
+    std::fill_n(presencePenalties, mDecoderDomain.getBatchSize(), DefaultDecodingParams::getPresencePenalty());
+    std::fill_n(frequencyPenalties, mDecoderDomain.getBatchSize(), DefaultDecodingParams::getFrequencyPenalty());
+    std::fill_n(minLengths, mDecoderDomain.getBatchSize(), DefaultDecodingParams::getMinLength());
+    std::fill_n(
+        promptIgnoreLengths, mDecoderDomain.getBatchSize(), DefaultDecodingParams::getPromptIgnoreLength());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -289,6 +303,31 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
     auto const* inputLengths = bufferCastOrNull<SizeType32>(params->inputLengths);
     auto embeddingBias = bufferCastOrNull<T>(params->embeddingBias);
     auto const* batchSlotsHostPtr = bufferCast<SizeType32>(*params->batchSlots);
+    bool const hasEmbeddingBias = params->embeddingBiasMask
+        && !allOfBatchSlots(batchSlotsHostPtr, bufferCast<bool>(*params->embeddingBiasMask.value()),
+            localDecoderDomain.getBatchSize(), false);
+    bool const hasBadWords = params->banWordsInputs && params->banWordsInputs->maxBadWordsLen != 0;
+
+    bool const canSkipPenalty = mDecoderDomain.getMaxDecodingTokens() == 1
+        && localDecoderDomain.getBeamWidth() == 1 && (params->logits.has_value() || params->logitsVec.has_value())
+        && !hasEmbeddingBias && !hasBadWords
+        && allOfBatchSlots(batchSlotsHostPtr, bufferCast<float>(*mTemperature), localDecoderDomain.getBatchSize(),
+            DefaultDecodingParams::getTemperature())
+        && allOfBatchSlots(batchSlotsHostPtr, bufferCast<float>(*mRepetitionPenalty), localDecoderDomain.getBatchSize(),
+            DefaultDecodingParams::getRepetitionPenalty())
+        && allOfBatchSlots(batchSlotsHostPtr, bufferCast<float>(*mPresencePenalty), localDecoderDomain.getBatchSize(),
+            DefaultDecodingParams::getPresencePenalty())
+        && allOfBatchSlots(batchSlotsHostPtr, bufferCast<float>(*mFrequencyPenalty), localDecoderDomain.getBatchSize(),
+            DefaultDecodingParams::getFrequencyPenalty())
+        && allOfBatchSlots(batchSlotsHostPtr, bufferCast<SizeType32>(*mMinLength), localDecoderDomain.getBatchSize(),
+            DefaultDecodingParams::getMinLength())
+        && allOfBatchSlots(batchSlotsHostPtr, bufferCast<SizeType32>(*mPromptIgnoreLength),
+            localDecoderDomain.getBatchSize(), DefaultDecodingParams::getPromptIgnoreLength());
+    if (canSkipPenalty)
+    {
+        return;
+    }
+
 #define GET_PENALTIES(capital_name, type)                                                                              \
     (mUse##capital_name                                                                                                \
         && !allOfBatchSlots(batchSlotsHostPtr, bufferCast<type>(*m##capital_name), localDecoderDomain.getBatchSize(),  \

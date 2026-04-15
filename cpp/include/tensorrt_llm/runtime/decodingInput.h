@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -67,6 +67,7 @@ public:
     //! The maximum sequence length for each sequence in the batch, [batchSize] on gpu
     TensorConstPtr sequenceLimitLength;
     TensorConstPtr embeddingBias;          // [batchSize, vocabSizePadded] on gpu
+    TensorConstPtr embeddingBiasMask;      // [batchSize] on cpu, true iff a request provided embedding bias
     TensorConstPtr lengths;                // [batchSize, beamWidth] on gpu
     std::vector<TensorPtr> badWordsLists;  // [batchSize][2, badWordsLength] on gpu
     TensorConstPtr badWordsPtrs;           // [batchSize][2, badWordsLength] on pinned

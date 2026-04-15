@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,6 +37,72 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+
+template <typename T, int32_t BLOCK_SIZE_>
+__global__ void greedySampling(T const* __restrict logProbs, T const* const* __restrict logProbsPtrs,
+    TokenIdType** idsPtrs, TokenIdType* ids, SizeType32* sequenceLengths, FinishedState const* finishedInput,
+    FinishedState* finishedOutput, TokenIdType const* endIds, bool const* skipDecode, SizeType32 const* batchSlots,
+    SizeType32 maxBatchSize, SizeType32 vocabSize, SizeType32 const* tokensPerStep, SizeType32 maxTokensPerStep,
+    SizeType32 maxSeqLen)
+{
+    using BlockReduce = cub::BlockReduce<TopK_2<float>, BLOCK_SIZE_>;
+    __shared__ typename BlockReduce::TempStorage tempStorage;
+
+    auto const tid = static_cast<SizeType32>(threadIdx.x);
+    auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
+    auto const tokenIdx = static_cast<SizeType32>(blockIdx.y);
+    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+    if (tokensPerStep != nullptr && tokenIdx >= tokensPerStep[batchSlot])
+    {
+        return;
+    }
+
+    FinishedState const finishState = finishedInput != nullptr ? finishedInput[batchSlot] : FinishedState::empty();
+    if ((skipDecode != nullptr && skipDecode[batchSlot]) || finishState.isSkipDecoding())
+    {
+        return;
+    }
+    if (finishState.isFinished())
+    {
+        if (finishedOutput != nullptr)
+        {
+            finishedOutput[batchSlot] = finishState;
+        }
+        return;
+    }
+
+    auto const logitsIndex = batchIdx * maxTokensPerStep * vocabSize + tokenIdx * vocabSize;
+    auto logitsRow
+        = logProbsPtrs == nullptr ? logProbs + logitsIndex : logProbsPtrs[batchIdx * maxTokensPerStep + tokenIdx];
+
+    TopK_2<float> partial;
+    partial.init();
+    for (auto vocabIdx = tid; vocabIdx < vocabSize; vocabIdx += BLOCK_SIZE_)
+    {
+        partial.insert(static_cast<float>(logitsRow[vocabIdx]), vocabIdx);
+    }
+
+    auto const best = BlockReduce(tempStorage).Reduce(partial, reduce_topk_op_2<float>);
+    if (tid == 0)
+    {
+        auto* outputIdsRequestPtr = idsPtrs == nullptr ? ids + batchSlot * maxSeqLen : idsPtrs[batchSlot];
+        auto const outputId = best.p >= 0 ? static_cast<TokenIdType>(best.p) : static_cast<TokenIdType>(vocabSize - 1);
+        auto const seqLen = sequenceLengths == nullptr ? 0 : sequenceLengths[batchSlot];
+        outputIdsRequestPtr[seqLen + tokenIdx] = outputId;
+
+        if (maxTokensPerStep == 1 && sequenceLengths != nullptr && finishedOutput != nullptr && endIds != nullptr)
+        {
+            if (outputId == endIds[batchSlot])
+            {
+                finishedOutput[batchSlot].setFinishedEOS();
+            }
+            else
+            {
+                sequenceLengths[batchSlot] += 1;
+            }
+        }
+    }
+}
 
 template <typename T, int32_t BLOCK_SIZE_, int32_t BLOCKS_PER_BEAM_>
 __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restrict logProbsPtrs, T* tmpLogProbs,
@@ -413,6 +479,31 @@ void invokeBatchTopKSampling(TopKSamplingKernelParams<T> const& params, cudaStre
 template void invokeBatchTopKSampling(TopKSamplingKernelParams<float> const& params, cudaStream_t stream);
 
 template void invokeBatchTopKSampling(TopKSamplingKernelParams<half> const& params, cudaStream_t stream);
+
+template <typename T>
+void invokeBatchGreedySampling(TopKSamplingKernelParams<T> const& params, cudaStream_t stream)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    params.checkParams();
+    TLLM_CHECK_WITH_INFO(params.maxTokensPerStep == 1, "Greedy fast path only supports maxTokensPerStep == 1");
+    TLLM_CHECK_WITH_INFO(params.outputLogProbs == nullptr && params.cumLogProbs == nullptr
+            && params.returnAllSelectedTokens == false && params.curandState == nullptr,
+        "Greedy fast path does not support log probs, cumulative log probs, return-all-selected, or sampling RNG");
+
+    dim3 const grid(params.batchSize, params.maxTokensPerStep);
+    dim3 const block(256);
+    greedySampling<T, 256><<<grid, block, 0, stream>>>(params.logProbs, params.logProbsPtrs, params.outputIdsPtrs,
+        params.outputIds, params.sequenceLengths, params.finishedInput, params.finishedOutput, params.endIds,
+        params.skipDecode, params.batchSlots, params.maxBatchSize, params.vocabSizePadded, params.tokensPerStep,
+        params.maxTokensPerStep, params.maxSeqLen);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template void invokeBatchGreedySampling(TopKSamplingKernelParams<float> const& params, cudaStream_t stream);
+
+template void invokeBatchGreedySampling(TopKSamplingKernelParams<half> const& params, cudaStream_t stream);
 
 __global__ void setupTopKRuntimeArgs(SizeType32 batchSize, ScatterDecodingParamEntry<SizeType32> topK,
     ScatterDecodingParamEntry<float> topP, SizeType32 const* batchSlots, bool* skipDecode)

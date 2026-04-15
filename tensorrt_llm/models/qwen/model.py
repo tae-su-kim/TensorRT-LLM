@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,17 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import OrderedDict
 import copy
 import os
 from typing import Optional, Union
 
+import tensorrt as trt
 import torch
 from tqdm import tqdm
 
-from ..._utils import pad_vocab_size
-from ...functional import LayerNormType, Tensor, recv, send
+from ..._common import default_net
+from ..._utils import pad_vocab_size, str_dtype_to_trt
+from ...functional import (LayerNormType, Tensor, gather_last_token_logits,
+                           recv, send)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, GatedMLP, RmsNorm, SharedMoE)
+                       AttentionParams, Embedding, GatedMLP,
+                       KeyValueCacheParams, RmsNorm, SharedMoE)
 from ...layers.moe import MOEWeightWrapper
 from ...logger import logger
 from ...lora_helper import (LoraConfig,
@@ -31,12 +36,29 @@ from ...lora_helper import (LoraConfig,
 from ...mapping import Mapping
 from ...module import Module
 from ...quantization import QuantAlgo
+from ..generation_mixin import GenerationMixin
 from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig)
+                              QuantConfig, get_kv_cache_type_from_legacy)
 from .config import QWenConfig
 from .convert import (load_hf_qwen, load_weights_from_hf_gptq_model,
                       load_weights_from_hf_model)
+from .hybrid import (QWen3_5Model, expand_qwen3_5_layer_types,
+                     qwen3_5_attention_layer_indices)
+
+
+def _raise_if_unsupported_legacy_qwen_backend(config: QWenConfig) -> None:
+    if config.qwen_type != 'qwen3_5':
+        return
+
+    if config.mapping.tp_size != 1:
+        raise NotImplementedError(
+            "Legacy TensorRT Qwen3.5 support currently requires tp_size == 1."
+        )
+    if config.mapping.pp_size != 1:
+        raise NotImplementedError(
+            "Legacy TensorRT Qwen3.5 support currently requires pp_size == 1."
+        )
 
 
 class QWenDecoderLayer(Module):
@@ -235,7 +257,8 @@ class QWenForCausalLM(DecoderModelForCausalLM):
     config_class = QWenConfig
 
     def __init__(self, config: QWenConfig):
-        transformer = QWenModel(config)
+        transformer = QWen3_5Model(
+            config) if config.qwen_type == 'qwen3_5' else QWenModel(config)
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
 
@@ -294,7 +317,331 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 })
         else:
             self.trtllm_modules_to_hf_modules = None
+        self.gather_context_logits = False
+        self.layer_types = expand_qwen3_5_layer_types(
+            config) if config.qwen_type == 'qwen3_5' else []
         super().__init__(config, transformer, lm_head)
+
+    def forward(self,
+                input_ids: Tensor,
+                position_ids=None,
+                use_cache=False,
+                last_token_ids=None,
+                last_token_ids_for_logits=None,
+                attention_mask=None,
+                kv_cache_params=None,
+                attention_params=None,
+                conv_states=None,
+                rnn_states=None,
+                mrope_params=None,
+                hidden_states=None,
+                prompt_embedding_table: Optional[Tensor] = None,
+                prompt_tasks: Optional[Tensor] = None,
+                prompt_vocab_size: Optional[Tensor] = None,
+                lora_params=None,
+                spec_decoding_params=None):
+        if self.config.qwen_type != 'qwen3_5':
+            return super().forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                use_cache=use_cache,
+                last_token_ids=last_token_ids,
+                attention_mask=attention_mask,
+                kv_cache_params=kv_cache_params,
+                attention_params=attention_params,
+                mrope_params=mrope_params,
+                hidden_states=hidden_states,
+                prompt_embedding_table=prompt_embedding_table,
+                prompt_tasks=prompt_tasks,
+                prompt_vocab_size=prompt_vocab_size,
+                lora_params=lora_params,
+                spec_decoding_params=spec_decoding_params)
+
+        attention_params = Attention.fill_attention_params(
+            self, attention_params)
+        hidden_states, present_kvs, present_convs, present_rnns = self.transformer(
+            input_ids=input_ids,
+            use_cache=use_cache,
+            attention_mask=attention_mask,
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params,
+            conv_states=conv_states,
+            rnn_states=rnn_states,
+            hidden_states=hidden_states,
+            prompt_embedding_table=prompt_embedding_table,
+            prompt_tasks=prompt_tasks,
+            prompt_vocab_size=prompt_vocab_size,
+            lora_params=lora_params,
+            spec_decoding_params=spec_decoding_params,
+            mrope_params=mrope_params)
+
+        if not self.gather_context_logits:
+            if last_token_ids_for_logits is None:
+                last_token_ids_for_logits = last_token_ids
+            hidden_states = gather_last_token_logits(
+                hidden_states, last_token_ids_for_logits,
+                default_net().plugin_config.remove_input_padding)
+
+        lm_logits = self.lm_head(hidden_states)
+        lm_logits.mark_output('logits', self.config.logits_dtype)
+
+        if not default_net().plugin_config.paged_kv_cache:
+            for i, present_kv in enumerate(present_kvs):
+                if present_kv is not None:
+                    present_kv.mark_output(f'present_key_value_{i}',
+                                           self.config.kv_dtype)
+
+        if not default_net().plugin_config.paged_state:
+            for i, present_conv in enumerate(present_convs):
+                if present_conv is not None:
+                    present_conv.mark_output(f'present_conv_state_{i}',
+                                             self.config.dtype)
+            for i, present_rnn in enumerate(present_rnns):
+                if present_rnn is not None:
+                    present_rnn.mark_output(f'present_rnn_state_{i}',
+                                            str_dtype_to_trt(
+                                                self.config.state_dtype))
+
+        return (lm_logits, present_kvs, present_convs, present_rnns)
+
+    def prepare_recurrent_inputs(self, max_batch_size, num_profiles,
+                                 mapping: Mapping):
+        del mapping
+        conv_states = []
+        rnn_states = []
+        batch_range = [GenerationMixin.default_range(max_batch_size)
+                       ] * num_profiles
+        conv_state_dim_range = OrderedDict([
+            ('batch_size', batch_range),
+            ('dim_size', [self.config.rnn_conv_dim_size] * num_profiles),
+            ('kernel_size', [self.config.conv_kernel - 1] * num_profiles),
+        ])
+        rnn_state_dim_range = OrderedDict([
+            ('batch_size', batch_range),
+            ('head_size',
+             [self.config.rnn_hidden_size // self.config.rnn_head_size] *
+             num_profiles),
+            ('value_size', [self.config.rnn_head_size] * num_profiles),
+            ('state_size', [self.config.state_size] * num_profiles),
+        ])
+
+        for layer_idx in range(self.config.num_hidden_layers):
+            if self.layer_types[layer_idx] == 'recurrent':
+                conv_state = Tensor(
+                    name=f'past_conv_state_{layer_idx}',
+                    dtype=self.config.dtype,
+                    shape=[-1, self.config.rnn_conv_dim_size,
+                           self.config.conv_kernel - 1],
+                    dim_range=conv_state_dim_range)
+                rnn_state = Tensor(
+                    name=f'past_rnn_state_{layer_idx}',
+                    dtype=str_dtype_to_trt(self.config.state_dtype),
+                    shape=[
+                        -1,
+                        self.config.rnn_hidden_size // self.config.rnn_head_size,
+                        self.config.rnn_head_size,
+                        self.config.state_size,
+                    ],
+                    dim_range=rnn_state_dim_range)
+            else:
+                conv_state = None
+                rnn_state = None
+            conv_states.append(conv_state)
+            rnn_states.append(rnn_state)
+
+        return {
+            'conv_states': conv_states,
+            'rnn_states': rnn_states,
+        }
+
+    def prepare_inputs(
+            self,
+            max_batch_size,
+            max_input_len,
+            max_seq_len,
+            max_num_tokens,
+            use_cache,
+            max_beam_width: int = 1,
+            opt_num_tokens: int = None,
+            opt_batch_size: int = 0,
+            prompt_embedding_table_size: int = 0,
+            max_draft_len: int = 0,
+            gather_context_logits: bool = False,
+            lora_target_modules: list[str] = None,
+            speculative_decoding_draft_tokens_external: bool = False):
+        if self.config.qwen_type != 'qwen3_5':
+            return super().prepare_inputs(
+                max_batch_size=max_batch_size,
+                max_input_len=max_input_len,
+                max_seq_len=max_seq_len,
+                max_num_tokens=max_num_tokens,
+                use_cache=use_cache,
+                max_beam_width=max_beam_width,
+                opt_num_tokens=opt_num_tokens,
+                opt_batch_size=opt_batch_size,
+                prompt_embedding_table_size=prompt_embedding_table_size,
+                max_draft_len=max_draft_len,
+                gather_context_logits=gather_context_logits,
+                lora_target_modules=lora_target_modules,
+                speculative_decoding_draft_tokens_external=
+                speculative_decoding_draft_tokens_external)
+
+        del prompt_embedding_table_size
+        del lora_target_modules
+        assert speculative_decoding_draft_tokens_external == False, \
+            "We don't support speculative decoding for the Qwen3.5 legacy TensorRT model."
+        assert max_beam_width == 1, \
+            "We don't support beam search for the Qwen3.5 legacy TensorRT model."
+
+        remove_input_padding = default_net().plugin_config.remove_input_padding
+        use_gpt_attention_plugin = default_net(
+        ).plugin_config.gpt_attention_plugin
+        use_gemm_plugin = default_net().plugin_config.gemm_plugin
+        paged_kv_cache = default_net().plugin_config.paged_kv_cache
+        tokens_per_block = default_net().plugin_config.tokens_per_block
+        multiple_profiles = default_net().plugin_config.multiple_profiles
+        use_mamba_conv1d_plugin = bool(
+            default_net().plugin_config.mamba_conv1d_plugin)
+
+        assert not remove_input_padding, \
+            "Qwen3.5 legacy TensorRT support requires remove_input_padding == False."
+        assert not default_net().plugin_config.paged_state, \
+            "Qwen3.5 legacy TensorRT support requires paged_state == False."
+        assert not use_mamba_conv1d_plugin, \
+            "Qwen3.5 legacy TensorRT support requires mamba_conv1d_plugin == False."
+
+        self.gather_context_logits = gather_context_logits
+        mapping = self.config.mapping
+        kv_cache_type = get_kv_cache_type_from_legacy(use_cache,
+                                                      paged_kv_cache)
+
+        enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
+            use_gpt_attention_plugin=use_gpt_attention_plugin,
+            use_gemm_plugin=use_gemm_plugin,
+            remove_input_padding=remove_input_padding,
+            kv_cache_type=kv_cache_type)
+        num_profiles, ranges = GenerationMixin.get_profiles_ranges(
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
+            max_num_tokens=max_num_tokens,
+            max_draft_len=max_draft_len,
+            opt_batch_size=opt_batch_size,
+            opt_num_tokens=opt_num_tokens,
+            enable_ctx_gen_opt_profiles=enable_ctx_gen_opt_profiles,
+            multiple_profiles=multiple_profiles,
+            kv_cache_type=kv_cache_type)
+
+        input_ids = Tensor(name='input_ids',
+                           dtype=trt.int32,
+                           shape=[-1, -1],
+                           dim_range=OrderedDict([
+                               ('batch_size_beam_width', ranges['bb_range']),
+                               ('input_len', ranges['inlen_range']),
+                           ]))
+        position_ids = Tensor(name='position_ids',
+                              dtype=trt.int32,
+                              shape=[-1, -1],
+                              dim_range=OrderedDict([
+                                  ('batch_size_beam_width', ranges['bb_range']),
+                                  ('position_ids_inlen_range',
+                                   ranges['position_ids_inlen_range']),
+                              ]))
+
+        attn_layer_idx = qwen3_5_attention_layer_indices(self.config)
+        attention_inputs = self.prepare_attention_inputs(
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
+            max_seq_len=max_seq_len,
+            num_kv_heads=self.config.num_key_value_heads,
+            head_size=self.config.head_size,
+            num_layers=self.config.num_hidden_layers,
+            kv_dtype=str_dtype_to_trt(self.config.kv_dtype),
+            kv_cache_type=kv_cache_type,
+            num_profiles=num_profiles,
+            enable_ctx_gen_opt_profiles=enable_ctx_gen_opt_profiles,
+            remove_input_padding=remove_input_padding,
+            use_gpt_attention_plugin=use_gpt_attention_plugin,
+            tokens_per_block=tokens_per_block,
+            mapping=mapping,
+            attn_layer_idx=attn_layer_idx)
+
+        host_context_lengths = attention_inputs['host_context_lengths']
+        if host_context_lengths is None:
+            host_context_lengths = Tensor(
+                name='host_context_lengths',
+                dtype=trt.int32,
+                shape=[-1],
+                dim_range=OrderedDict([('batch_size_beam_width',
+                                        ranges['bb_range'])]),
+            )
+
+        recurrent_inputs = self.prepare_recurrent_inputs(
+            max_batch_size=max_batch_size,
+            num_profiles=num_profiles,
+            mapping=mapping)
+
+        last_token_ids = Tensor(
+            name='last_token_ids',
+            dtype=trt.int32,
+            shape=[-1],
+            dim_range=OrderedDict([
+                ('batch_size_last_token_ids', ranges['bbd_range']),
+            ]),
+        )
+        last_token_ids_for_logits = None
+        if not gather_context_logits:
+            last_token_ids_for_logits = last_token_ids
+
+        return {
+            'input_ids':
+            input_ids,
+            'position_ids':
+            position_ids,
+            'use_cache':
+            True,
+            'last_token_ids':
+            last_token_ids,
+            'last_token_ids_for_logits':
+            last_token_ids_for_logits,
+            'attention_mask':
+            attention_inputs['attention_mask'],
+            'kv_cache_params':
+            KeyValueCacheParams(
+                past_key_value=attention_inputs['past_key_value'],
+                host_past_key_value_lengths=attention_inputs[
+                    'host_past_key_value_lengths'],
+                host_max_attention_window_sizes=attention_inputs[
+                    'host_max_attention_window_sizes'],
+                host_sink_token_length=attention_inputs[
+                    'host_sink_token_length'],
+                kv_cache_block_offsets=attention_inputs[
+                    'kv_cache_block_offsets'],
+                host_kv_cache_block_offsets=attention_inputs[
+                    'host_kv_cache_block_offsets'],
+                host_kv_cache_pool_pointers=attention_inputs[
+                    'host_kv_cache_pool_pointers'],
+                host_kv_cache_pool_mapping=attention_inputs[
+                    'host_kv_cache_pool_mapping'],
+                cache_indirection=attention_inputs['cache_indirection'],
+            ),
+            'attention_params':
+            AttentionParams(
+                sequence_length=attention_inputs['sequence_length'],
+                context_lengths=attention_inputs['context_lengths'],
+                host_context_lengths=host_context_lengths,
+                max_context_length=max_input_len,
+                host_request_types=attention_inputs['host_request_types'],
+                host_runtime_perf_knobs=attention_inputs[
+                    'host_runtime_perf_knobs'],
+                host_context_progress=attention_inputs['host_context_progress'],
+            ),
+            'conv_states':
+            recurrent_inputs['conv_states'],
+            'rnn_states':
+            recurrent_inputs['rnn_states'],
+        }
 
     @classmethod
     def from_hugging_face(
@@ -326,6 +673,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                                               mapping=mapping,
                                               quant_config=quant_config,
                                               **kwargs)
+        _raise_if_unsupported_legacy_qwen_backend(config)
 
         if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
             arg_dict = {"use_autoawq": True} if use_autoawq else {}
@@ -380,8 +728,15 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "q_layernorm": "q_norm",
                     "k_layernorm": "k_norm",
                 }
+            elif config.qwen_type == "qwen3_5":
+                custom_dict = {
+                    "transformer": "model.language_model",
+                    "q_layernorm": "q_norm",
+                    "k_layernorm": "k_norm",
+                }
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             model = cls(config)
+
             if config.qwen_type == "qwen" and model.config.mapping.has_tp():
 
                 def reshape_qkv(weights):
@@ -472,6 +827,10 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 # For Qwen1 w/o TP, Qwen1.5 and Qwen2 w/o MoE
                 loader.generate_tllm_weights(model, arg_dict)
         else:
+            if config.qwen_type == "qwen3_5":
+                raise NotImplementedError(
+                    "Qwen3.5 legacy TensorRT support requires the unified "
+                    "ModelWeightsLoader path.")
             if not use_preloading:
                 hf_model = load_hf_qwen(hf_model_dir, load_model_on_cpu)
 
@@ -488,6 +847,11 @@ class QWenForCausalLM(DecoderModelForCausalLM):
         return model
 
     def default_plugin_config(self, **kwargs):
+        if self.config.qwen_type == 'qwen3_5':
+            kwargs.setdefault('remove_input_padding', False)
+            kwargs.setdefault('paged_state', False)
+            kwargs.setdefault('gated_delta_plugin', True)
+            kwargs.setdefault('mamba_conv1d_plugin', None)
         plugin_config = super().default_plugin_config(**kwargs)
         if self.quant_mode.is_int4_weight_only_per_group():
             plugin_config.weight_only_groupwise_quant_matmul_plugin = 'auto'
@@ -532,6 +896,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                                                   mapping=mapping,
                                                   quant_config=quant_config,
                                                   **kwargs)
+            _raise_if_unsupported_legacy_qwen_backend(config)
             convert.quantize(hf_model_dir,
                              output_dir,
                              config=config,

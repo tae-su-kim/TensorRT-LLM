@@ -174,9 +174,7 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
         maxSeqLen = inputDesc[getInputTensorIdx()].dims.d[1];
     }
 
-    // only support context or generation, not for both of them
     RequestType const* reqTypes = static_cast<RequestType const*>(inputs[getHostRequestTypesIdx()]);
-
     MambaConv1dParamsBase mambaConv1dParams;
 
     int const* slotMapping = mPagedState ? static_cast<int const*>(inputs[getSlotMappingIdx()]) : nullptr;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -181,6 +181,11 @@ struct TopKSamplingKernelParams
 // clang-format on
 template <typename T>
 void invokeBatchTopKSampling(TopKSamplingKernelParams<T> const& params, cudaStream_t stream);
+
+//! \brief Greedy specialization for maxTokensPerStep == 1 and beamWidth == 1.
+//! Selects the argmax token directly from logits/log-probs without softmax or TopK staging.
+template <typename T>
+void invokeBatchGreedySampling(TopKSamplingKernelParams<T> const& params, cudaStream_t stream);
 
 template <typename T>
 [[nodiscard]] std::vector<size_t> getTopKWorkspaceSizes(runtime::SizeType32 batchSize,

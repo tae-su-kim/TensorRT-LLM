@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,8 @@
 
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 
+#include "tensorrt_llm/batch_manager/directRnnStateBuffers.h"
+#include "tensorrt_llm/batch_manager/directRnnStateManager.h"
 #include "tensorrt_llm/batch_manager/encoderBuffers.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/loraBuffers.h"
@@ -87,9 +89,13 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         transformerBuffers = std::make_unique<TransformerBuffers>(maxBatchSize, maxBeamWidth, maxAttentionWindowVec,
             maxAttentionWindow, sinkTokenLen, runtime, modelConfig, worldConfig);
     }
-    if (modelConfig.isRnnBased())
+    if (modelConfig.usesPagedRecurrentState())
     {
         rnnStateBuffers = std::make_unique<RnnStateBuffers>(maxBatchSize, runtime);
+    }
+    if (modelConfig.usesDirectRecurrentState())
+    {
+        directRnnStateBuffers = std::make_unique<DirectRnnStateBuffers>(maxBatchSize, runtime, modelConfig, worldConfig);
     }
 
     auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
@@ -250,13 +256,15 @@ void RuntimeBuffers::setBufferSizes(RequestVector const& contextRequests, Reques
     auto numContextLogits = numContextRequests;
     numContextTokens = 0;
     maxContextLength = 0;
+    maxInputLengthInBatch = 1;
     for (auto const& llmReq : contextRequests)
     {
         auto const draftLength = llmReq->isLastContextChunk() ? llmReq->getNumDraftTokens() : 0;
+        auto const inputLength = llmReq->getContextChunkSize() + draftLength;
         numContextLogits += draftLength;
 
-        auto const contextChunkSize = llmReq->getContextChunkSize();
-        numContextTokens += contextChunkSize + draftLength;
+        numContextTokens += inputLength;
+        maxInputLengthInBatch = std::max(maxInputLengthInBatch, inputLength);
         if (maxContextLength < llmReq->mPromptLen)
         {
             maxContextLength = llmReq->mPromptLen;
@@ -273,6 +281,7 @@ void RuntimeBuffers::setBufferSizes(RequestVector const& contextRequests, Reques
         numGenSequences += reqBeamWidth;
         auto const draftLen = llmReq->getNumDraftTokens();
         numGenTokens += draftLen + reqBeamWidth;
+        maxInputLengthInBatch = std::max(maxInputLengthInBatch, draftLen + 1);
     }
 
     numLogits = numContextLogits + numGenTokens;
@@ -338,6 +347,11 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
         transformerBuffers->reshape(numSequences, numContextTokens + numGenTokens);
     }
 
+    if (directRnnStateBuffers)
+    {
+        directRnnStateBuffers->reshape(numSequences);
+    }
+
     if (rnnStateBuffers)
     {
         rnnStateBuffers->reshape(numSequences);
@@ -381,7 +395,16 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
     seqSlotsDevice->reshape(numRequestsShape);
 
     auto const numTokens = getNumTokens();
-    inputsIds->reshape(ITensor::makeShape({numTokens}));
+    auto const useNonPackedRnnInputs = !modelConfig.usePackedInput() && modelConfig.isRnnBased()
+        && worldConfig.isFirstPipelineParallelRank();
+    if (useNonPackedRnnInputs)
+    {
+        inputsIds->reshape(ITensor::makeShape({getNumSequences(), maxInputLengthInBatch}));
+    }
+    else
+    {
+        inputsIds->reshape(ITensor::makeShape({numTokens}));
+    }
 
     if (modelConfig.useMrope())
     {
@@ -447,7 +470,8 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
     SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, runtime::decoder::DecoderState const& decoderState,
     kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
     kv_cache_manager::BaseKVCacheManager* crossKvCacheManagerPtr,
-    rnn_state_manager::RnnStateManager* rnnStateManagerPtr, PeftTable const& peftTable,
+    rnn_state_manager::RnnStateManager* rnnStateManagerPtr,
+    rnn_state_manager::DirectRnnStateManager* directRnnStateManagerPtr, PeftTable const& peftTable,
     runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig, bool trtOverlap, OptionalRef<runtime::ITensor const> newOutputTokens)
 {
@@ -456,6 +480,12 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
 
     auto const& manager = runtime.getBufferManager();
     auto const& stream = runtime.getStream();
+    auto const useNonPackedRnnInputs = !modelConfig.usePackedInput() && modelConfig.isRnnBased()
+        && worldConfig.isFirstPipelineParallelRank();
+    auto const useNonPackedRnnPositionIds = useNonPackedRnnInputs && transformerBuffers != nullptr;
+
+    TLLM_CHECK_WITH_INFO(
+        !(useNonPackedRnnInputs && trtOverlap), "Non-packed recurrent engines do not support TRT overlap yet.");
 
     // Fill requestTypes
     {
@@ -480,6 +510,15 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
     bool const isChatGlm = modelConfig.getModelVariant() == ModelConfig::ModelVariant::kChatGlm;
     bool const isGlm = modelConfig.getModelVariant() == ModelConfig::ModelVariant::kGlm;
     auto const mropeRotaryCosSinSize = modelConfig.getMaxPositionEmbeddings() * modelConfig.getRotaryEmbeddingDim();
+
+    if (useNonPackedRnnInputs)
+    {
+        inputHost.resize(static_cast<std::size_t>(getNumSequences()) * maxInputLengthInBatch);
+    }
+    if (useNonPackedRnnPositionIds)
+    {
+        positionIdsHost.resize(static_cast<std::size_t>(getNumSequences()) * maxInputLengthInBatch);
+    }
 
     {
         NVTX3_SCOPED_RANGE(seqSlotsLoop);
@@ -523,18 +562,34 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             auto const contextChunkSize = llmReq->getContextChunkSize();
             auto const beginCompute = llmReq->getContextCurrentPosition();
             auto const endCompute = beginCompute + contextChunkSize;
-            inputHost.insert(inputHost.end(), reqTokens.begin() + beginCompute, reqTokens.begin() + endCompute);
+            auto const inputLength = contextChunkSize + (llmReq->isLastContextChunk() ? draftLength : 0);
+            auto const rowOffset = static_cast<std::size_t>(batchIdx) * maxInputLengthInBatch;
+            if (useNonPackedRnnInputs)
+            {
+                std::copy(reqTokens.begin() + beginCompute, reqTokens.begin() + endCompute, inputHost.begin() + rowOffset);
+            }
+            else
+            {
+                inputHost.insert(inputHost.end(), reqTokens.begin() + beginCompute, reqTokens.begin() + endCompute);
+            }
 
             logitsIdsHostPtr[totalNumLogits++] = contextChunkSize;
             numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
 
             if (llmReq->isLastContextChunk())
             {
-                inputHost.insert(inputHost.end(), draftTokens->begin(), draftTokens->end());
+                if (useNonPackedRnnInputs)
+                {
+                    std::copy(draftTokens->begin(), draftTokens->end(),
+                        inputHost.begin() + rowOffset + contextChunkSize);
+                }
+                else
+                {
+                    inputHost.insert(inputHost.end(), draftTokens->begin(), draftTokens->end());
+                }
                 std::fill_n(logitsIdsHostPtr + totalNumLogits, draftLength, 1);
                 totalNumLogits += draftLength;
             }
-            auto const inputLength = contextChunkSize + (llmReq->isLastContextChunk() ? draftLength : 0);
             contextLengthsHostPtr[batchIdx] = inputLength;
             auto const sequenceLen = inputLength + llmReq->getContextCurrentPosition();
             sequenceLengthsHostPtr[batchIdx] = sequenceLen;
@@ -547,8 +602,16 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             if (positionIds.has_value())
             {
                 TLLM_CHECK_WITH_INFO(!(isChatGlm || isGlm), "ChatGLM-6B and Glm only use the default initialization");
-                positionIdsHost.insert(positionIdsHost.end(), positionIds.value()->begin() + beginCompute,
-                    positionIds.value()->begin() + endCompute);
+                if (useNonPackedRnnPositionIds)
+                {
+                    std::copy(positionIds.value()->begin() + beginCompute, positionIds.value()->begin() + endCompute,
+                        positionIdsHost.begin() + rowOffset);
+                }
+                else
+                {
+                    positionIdsHost.insert(positionIdsHost.end(), positionIds.value()->begin() + beginCompute,
+                        positionIds.value()->begin() + endCompute);
+                }
             }
             else
             {
@@ -581,9 +644,17 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
                 else
                 {
                     // Other models
-                    positionIdsHost.resize(totalInputSize + inputLength);
-                    std::iota(std::begin(positionIdsHost) + totalInputSize,
-                        std::begin(positionIdsHost) + totalInputSize + inputLength, beginCompute);
+                    if (useNonPackedRnnPositionIds)
+                    {
+                        std::iota(positionIdsHost.begin() + rowOffset,
+                            positionIdsHost.begin() + rowOffset + inputLength, beginCompute);
+                    }
+                    else
+                    {
+                        positionIdsHost.resize(totalInputSize + inputLength);
+                        std::iota(std::begin(positionIdsHost) + totalInputSize,
+                            std::begin(positionIdsHost) + totalInputSize + inputLength, beginCompute);
+                    }
                 }
             }
             if (modelConfig.useMrope())
@@ -604,7 +675,10 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
                 languageAdapterRoutingsHost.insert(languageAdapterRoutingsHost.end(),
                     std::begin(languageAdapterRouting), std::end(languageAdapterRouting));
             }
-            totalInputSize += inputLength;
+            if (!useNonPackedRnnInputs)
+            {
+                totalInputSize += inputLength;
+            }
             ++batchIdx;
         }
 
@@ -636,14 +710,29 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             for (int beam = 0; beam < reqBeamWidth; ++beam)
             {
                 auto const numTokens = llmReq->getNumTokens(beam) + static_cast<SizeType32>(trtOverlap);
+                auto const rowOffset = static_cast<std::size_t>(numSequences + beam) * maxInputLengthInBatch;
                 // TODO: can this be removed completely?
                 if (!trtOverlap)
                 {
                     auto const lastToken = llmReq->getLastTokens(beam);
-                    inputHost.push_back(lastToken);
+                    if (useNonPackedRnnInputs)
+                    {
+                        inputHost.at(rowOffset) = lastToken;
+                    }
+                    else
+                    {
+                        inputHost.push_back(lastToken);
+                    }
                     if (draftLength > 0)
                     {
-                        inputHost.insert(inputHost.end(), draftTokens->begin(), draftTokens->end());
+                        if (useNonPackedRnnInputs)
+                        {
+                            std::copy(draftTokens->begin(), draftTokens->end(), inputHost.begin() + rowOffset + 1);
+                        }
+                        else
+                        {
+                            inputHost.insert(inputHost.end(), draftTokens->begin(), draftTokens->end());
+                        }
                     }
                 }
 
@@ -673,7 +762,14 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
                         else // GPT / ChatGLM2-6B / ChatGLM3-6B / BART
                         {
                             // positionIds is just the size of tokens -1
-                            positionIdsHost.push_back(numTokens - 1);
+                            if (useNonPackedRnnPositionIds)
+                            {
+                                positionIdsHost.at(rowOffset) = numTokens - 1;
+                            }
+                            else
+                            {
+                                positionIdsHost.push_back(numTokens - 1);
+                            }
                         }
                     }
                 }
@@ -699,7 +795,10 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
                 SizeType32 pastKeyValueLength = sequenceLen - 1;
                 std::fill_n(pastKeyValueLengthsPtr + numSequences, reqBeamWidth, pastKeyValueLength);
             }
-            totalInputSize += numLogits;
+            if (!useNonPackedRnnInputs)
+            {
+                totalInputSize += numLogits;
+            }
 
             std::fill_n(logitsIdsHostPtr + totalNumLogits, numLogits, 1);
 
@@ -739,6 +838,14 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             mLookaheadBuffers->setFromInputs(numContextRequests, numGenRequests, *requestTypes, *seqSlots,
                 decoderState.getLookaheadBuffers(), runtime, modelConfig, worldConfig);
         }
+    }
+
+    if (directRnnStateBuffers)
+    {
+        TLLM_CHECK_WITH_INFO(
+            directRnnStateManagerPtr != nullptr, "Direct recurrent runtime buffers require DirectRnnStateManager.");
+        directRnnStateBuffers->setFromInputs(
+            numContextRequests, getNumSequences(), *seqSlots, *directRnnStateManagerPtr, runtime);
     }
 
     // check skipCrossAttnBlocks
@@ -813,13 +920,14 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         auto lastTokenIdsHostRange = BufferRange<SizeType32>(*lastTokenIdsHost);
         common::stl_utils::inclusiveScan(
             logitsIdsHostRange.begin(), logitsIdsHostRange.end(), lastTokenIdsHostRange.begin());
-        manager.copy(*lastTokenIdsHost, *lastTokenIdsDevice);
+            manager.copy(*lastTokenIdsHost, *lastTokenIdsDevice);
         if (transformerBuffers)
         {
             TensorPtr decoderPositionIds = modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding()
                 ? mLookaheadBuffers->positionIdsDevice
                 : nullptr;
-            transformerBuffers->copyPositionIds(runtime, positionIdsHost, isChatGlm || isGlm, decoderPositionIds);
+            transformerBuffers->copyPositionIds(runtime, positionIdsHost, isChatGlm || isGlm, decoderPositionIds,
+                useNonPackedRnnPositionIds, getNumSequences(), maxInputLengthInBatch);
         }
         if (rnnStateBuffers)
         {
@@ -905,9 +1013,10 @@ std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorM
     RequestVector const& contextRequests, RequestVector const& genRequests, SizeType32 maxBeamWidth,
     SizeType32 maxAttentionWindow, runtime::decoder::DecoderState const& decoderState,
     kv_cache_manager::BaseKVCacheManager* kvCacheManager, kv_cache_manager::BaseKVCacheManager* crossKvCacheManager,
-    rnn_state_manager::RnnStateManager* rnnStateManager, PeftTable const& peftTable, TllmRuntime const& runtime,
-    ModelConfig const& modelConfig, WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
-    OptionalRef<runtime::ITensor const> newOutputTokens)
+    rnn_state_manager::RnnStateManager* rnnStateManager,
+    rnn_state_manager::DirectRnnStateManager* directRnnStateManager, PeftTable const& peftTable,
+    TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    bool gatherGenerationLogits, bool trtOverlap, OptionalRef<runtime::ITensor const> newOutputTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(runtimeBuffersPrepareStep);
@@ -916,18 +1025,37 @@ std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorM
     reshape(runtime, modelConfig, worldConfig, gatherGenerationLogits);
 
     setFromInputs(contextRequests, genRequests, maxBeamWidth, maxAttentionWindow, decoderState, kvCacheManager,
-        crossKvCacheManager, rnnStateManager, peftTable, runtime, modelConfig, worldConfig, trtOverlap,
-        newOutputTokens);
+        crossKvCacheManager, rnnStateManager, directRnnStateManager, peftTable, runtime, modelConfig, worldConfig,
+        trtOverlap, newOutputTokens);
 
     fillIOMaps(modelConfig, worldConfig);
 
     auto const numTokens = getNumTokens();
-    auto const optProfileId = runtime.getOptProfileId(numTokens, ModelConfig::getOptProfilesSplitPoints());
+    auto optProfileId = runtime.getOptProfileId(numTokens, ModelConfig::getOptProfilesSplitPoints());
+    if (modelConfig.isRnnBased() && !modelConfig.usePackedInput() && runtime.getNbProfiles() == 2)
+    {
+        // Legacy non-packed recurrent engines build one context profile and one generation profile.
+        // Route any step with context requests to the context profile and pure decode steps to the generation profile.
+        optProfileId = numContextRequests > 0 ? 0 : 1;
+    }
     setContextIndex(optProfileId);
     TLLM_LOG_DEBUG("numTokens: %d, optProfileId: %d", numTokens, optProfileId);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return {optProfileId, inputMap, outputMap};
+}
+
+void RuntimeBuffers::commitDirectRnnStateOutputs(
+    rnn_state_manager::DirectRnnStateManager* directRnnStateManager, TllmRuntime const& runtime)
+{
+    if (!directRnnStateBuffers)
+    {
+        return;
+    }
+
+    TLLM_CHECK_WITH_INFO(
+        directRnnStateManager != nullptr, "Direct recurrent runtime buffers require DirectRnnStateManager.");
+    directRnnStateBuffers->commitOutputs(getNumSequences(), *seqSlots, *directRnnStateManager, runtime);
 }
 
 void RuntimeBuffers::fillIOMaps(ModelConfig const& modelConfig, WorldConfig const& worldConfig)
@@ -941,6 +1069,10 @@ void RuntimeBuffers::fillIOMaps(ModelConfig const& modelConfig, WorldConfig cons
     if (transformerBuffers)
     {
         transformerBuffers->getBuffers(inputMap, outputMap, modelConfig);
+    }
+    if (directRnnStateBuffers)
+    {
+        directRnnStateBuffers->getBuffers(inputMap, outputMap);
     }
     if (rnnStateBuffers)
     {

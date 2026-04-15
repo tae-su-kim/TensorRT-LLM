@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -69,6 +69,9 @@ private:
     TensorPtr mRuntimeMinPHost;
     TensorPtr mRuntimeMinPDevice;
     bool mUseMinP{false};
+    TensorPtr mGreedySamplingHost;
+    TensorPtr mLogitsPtrsHost;
+    bool mNormalizeLogProbs{false};
 
     std::vector<std::unique_ptr<BaseLayer>> mSamplingLayers;
 

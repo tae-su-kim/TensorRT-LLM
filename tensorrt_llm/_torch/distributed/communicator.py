@@ -17,9 +17,10 @@ except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
 from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
-from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
-                                 mpi_disabled, mpi_isend, mpi_isend_object,
-                                 mpi_recv, mpi_recv_object, mpi_send,
+from tensorrt_llm._utils import (get_free_port, mpi_allgather, mpi_barrier,
+                                 mpi_comm, mpi_disabled, mpi_isend,
+                                 mpi_isend_object, mpi_recv,
+                                 mpi_recv_object, mpi_send,
                                  mpi_send_object, mpi_world_size,
                                  torch_pybind11_abi)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
@@ -760,8 +761,15 @@ class TorchDist(Distributed):
 
     def __init__(self, mapping: Mapping):
         super().__init__(mapping)
-        assert dist.is_initialized(
-        ), "torch.distributed should be initialized before TorchDist"
+        if not dist.is_initialized():
+            if mapping.world_size != 1:
+                raise AssertionError(
+                    "torch.distributed should be initialized before "
+                    "TorchDist")
+            dist.init_process_group(backend="cuda:nccl,cpu:gloo",
+                                    init_method=f"tcp://127.0.0.1:{get_free_port()}",
+                                    world_size=1,
+                                    rank=0)
 
         self.cluster_info = None
 
@@ -778,6 +786,10 @@ class TorchDist(Distributed):
 
     def setup_local_comm(self):
         self._get_cluster_info()
+
+        if torch.distributed.get_world_size() == 1:
+            self.local_comm = torch.distributed.group.WORLD
+            return
 
         # node IP -> list of ranks
         ip_to_ranks = {}
@@ -801,10 +813,13 @@ class TorchDist(Distributed):
 
         if ray.is_initialized():
             node_ip = ray.util.get_node_ip_address()
+            gpu_index = [int(id) for id in ray.get_gpu_ids()]
         else:
+            if torch.distributed.get_world_size() == 1:
+                gpu_index = [torch.cuda.current_device()]
+                self.cluster_info = [("127.0.0.1", gpu_index[0])]
+                return self.cluster_info
             raise RuntimeError("Ray is not initialized")
-
-        gpu_index = [int(id) for id in ray.get_gpu_ids()]
 
         assert len(gpu_index) == 1
 

@@ -1,5 +1,9 @@
 import re
 
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
+from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import \
+    Qwen3_5MoeHfWeightMapper
 from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_utils import register_auto_model
 
@@ -34,6 +38,32 @@ def _normalize_qwen35_exclude_modules(model_config):
     qc.exclude_modules = sorted(normalized)
 
 
+def _ensure_qwen35_weight_mapper(
+    model: Qwen3NextForCausalLM,
+    weight_mapper: BaseWeightMapper | None,
+) -> Qwen3_5MoeHfWeightMapper:
+    """Ensure Qwen3.5 checkpoints always use the Qwen3.5 HF weight mapper.
+
+    Qwen3.5 text checkpoints need extra preprocessing beyond the base
+    Qwen3Next path:
+    - strip the ``model.language_model.`` prefix used by VLM checkpoints
+    - drop vision tensors
+    - pack split linear-attention projections into TRT-LLM's grouped layout
+
+    The wrapper classes exist specifically to represent Qwen3.5 architectures,
+    so they should not rely on the caller having already selected the right
+    mapper. Re-wrap the mapper here when needed.
+    """
+    if isinstance(weight_mapper, Qwen3_5MoeHfWeightMapper):
+        return weight_mapper
+
+    qwen35_weight_mapper = Qwen3_5MoeHfWeightMapper()
+    qwen35_weight_mapper.init_model_and_config(model, model.model_config)
+    if weight_mapper is not None:
+        qwen35_weight_mapper.add_skip_modules(weight_mapper.skip_modules)
+    return qwen35_weight_mapper
+
+
 @register_auto_model("Qwen3_5MoeForCausalLM")
 class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
     """Thin wrapper that registers the Qwen3.5 MoE text architecture.
@@ -60,6 +90,12 @@ class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
         _normalize_qwen35_exclude_modules(model_config)
         super().__init__(model_config)
 
+    def load_weights(self, weights, weight_mapper=None):
+        super().load_weights(
+            weights,
+            _ensure_qwen35_weight_mapper(self, weight_mapper),
+        )
+
 
 @register_auto_model("Qwen3_5ForCausalLM")
 class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
@@ -74,3 +110,9 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
     def __init__(self, model_config):
         _normalize_qwen35_exclude_modules(model_config)
         super().__init__(model_config)
+
+    def load_weights(self, weights, weight_mapper=None):
+        super().load_weights(
+            weights,
+            _ensure_qwen35_weight_mapper(self, weight_mapper),
+        )

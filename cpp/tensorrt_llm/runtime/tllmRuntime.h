@@ -68,7 +68,7 @@ public:
         }
         auto const it = std::lower_bound(splitPoints.begin(), splitPoints.end(), numTokens);
         auto const optProfileId = std::distance(splitPoints.begin(), it);
-        return optProfileId;
+        return std::min<SizeType32>(optProfileId, getNbProfiles() - 1);
     }
 
     nvinfer1::IExecutionContext& addContext(std::int32_t profileIndex);

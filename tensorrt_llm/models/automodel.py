@@ -7,6 +7,37 @@ from . import MODEL_MAP
 from .modeling_utils import QuantConfig
 
 
+def _get_hf_architecture(hf_model_or_dir,
+                         trust_remote_code: bool = False) -> str:
+    import transformers
+
+    model_type = None
+    architectures = None
+
+    try:
+        hf_config = transformers.AutoConfig.from_pretrained(
+            hf_model_or_dir, trust_remote_code=trust_remote_code)
+    except Exception:
+        config_dict, _ = transformers.PretrainedConfig.get_config_dict(
+            hf_model_or_dir, trust_remote_code=trust_remote_code)
+        architectures = config_dict.get('architectures')
+        model_type = config_dict.get('model_type')
+    else:
+        architectures = getattr(hf_config, 'architectures', None)
+        model_type = getattr(hf_config, 'model_type', None)
+
+    if architectures is not None:
+        return architectures[0]
+    if model_type == 'qwen3_5':
+        return 'Qwen3_5ForConditionalGeneration'
+    if isinstance(model_type, str) and model_type.find('mamba') != -1:
+        return 'MambaForCausalLM'
+
+    raise NotImplementedError(
+        f"Could not infer a supported Hugging Face architecture from {hf_model_or_dir}"
+    )
+
+
 class AutoConfig:
 
     @staticmethod
@@ -17,16 +48,8 @@ class AutoConfig:
                           **kwargs):
         import transformers
         trust_remote_code = kwargs.get('trust_remote_code', False)
-
-        hf_config = transformers.AutoConfig.from_pretrained(
-            hf_model_or_dir, trust_remote_code=trust_remote_code)
-
-        if hasattr(hf_config,
-                   'architectures') and hf_config.architectures is not None:
-            hf_arch = hf_config.architectures[0]
-        elif hasattr(hf_config,
-                     'model_type') and hf_config.model_type.find('mamba') != -1:
-            hf_arch = 'MambaForCausalLM'
+        hf_arch = _get_hf_architecture(hf_model_or_dir,
+                                       trust_remote_code=trust_remote_code)
 
         trtllm_model_cls = MODEL_MAP.get(hf_arch, None)
         if trtllm_model_cls is None:
@@ -55,16 +78,12 @@ class AutoModelForCausalLM:
     def get_trtllm_model_class(hf_model_or_dir: Union[str, Path],
                                trust_remote_code: bool = False,
                                decoding_mode: DecodingMode = None):
-        import transformers
-
         hf_model_or_dir = Path(hf_model_or_dir) if not isinstance(
             hf_model_or_dir, Path) else hf_model_or_dir
 
         assert (hf_model_or_dir / "config.json").exists(
         ), "Please provide a Hugging Face model as the input to the LLM API."
 
-        hf_config = transformers.AutoConfig.from_pretrained(
-            hf_model_or_dir, trust_remote_code=trust_remote_code)
         if decoding_mode is not None:
             if decoding_mode.isMedusa():
                 hf_arch = 'MedusaForCausalLM'
@@ -72,12 +91,9 @@ class AutoModelForCausalLM:
                 hf_arch = 'EagleForCausalLM'
             else:
                 raise NotImplementedError(f"Unknown speculative decoding mode.")
-        elif hasattr(hf_config,
-                     'architectures') and hf_config.architectures is not None:
-            hf_arch = hf_config.architectures[0]
-        elif hasattr(hf_config,
-                     'model_type') and hf_config.model_type.find('mamba') != -1:
-            hf_arch = 'MambaForCausalLM'
+        else:
+            hf_arch = _get_hf_architecture(hf_model_or_dir,
+                                           trust_remote_code=trust_remote_code)
 
         trtllm_model_cls = MODEL_MAP.get(hf_arch, None)
 
@@ -94,7 +110,8 @@ class AutoModelForCausalLM:
                           quant_config: Optional[QuantConfig] = None,
                           **kwargs):
         trtllm_model_cls = AutoModelForCausalLM.get_trtllm_model_class(
-            hf_model_or_dir)
+            hf_model_or_dir,
+            trust_remote_code=kwargs.get('trust_remote_code', False))
 
         if not hasattr(trtllm_model_cls, 'from_hugging_face'):
             raise NotImplementedError(

@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import shutil
+import weakref
 from pathlib import Path
 from typing import Tuple, get_args
+
 import click
 from click_option_group import AllOptionGroup, optgroup
 
 from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid, load_pretrained_config
+from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.utils.data import create_dataset_from_stream, initialize_tokenizer
-from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm.llmapi.llm_utils import QuantConfig
+from tensorrt_llm.llmapi import TrtLlmArgs
+from tensorrt_llm.llmapi.llm_utils import CachedModelLoader, LlmBuildStats, QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig
@@ -126,6 +129,48 @@ def apply_build_mode_settings(params):
     # If dataset is not specified, max_seq_len must be provided.
     if not dataset_path and not max_seq_len:
         raise ValueError("Unspecified max_seq_len for engine build. Exiting.")
+
+
+def build_engine_without_executor(
+    *,
+    checkpoint_path: str | Path,
+    tokenizer_path: str | Path,
+    model_dtype: str,
+    tp_size: int,
+    pp_size: int,
+    build_config: BuildConfig,
+    quant_config: QuantConfig,
+    workspace: Path,
+    engine_dir: Path,
+    load_format: str,
+    trust_remote_code: bool,
+    telemetry_config,
+) -> None:
+    """Build an engine without constructing the TensorRT executor."""
+    llm_args = TrtLlmArgs(
+        model=checkpoint_path,
+        tokenizer=tokenizer_path,
+        dtype=model_dtype,
+        tensor_parallel_size=tp_size,
+        pipeline_parallel_size=pp_size,
+        build_config=build_config,
+        quant_config=quant_config,
+        workspace=str(workspace),
+        load_format=load_format,
+        trust_remote_code=trust_remote_code,
+        telemetry_config=telemetry_config,
+    )
+    llm_build_stats = LlmBuildStats()
+    model_loader = CachedModelLoader(
+        llm_args,
+        llm_build_stats=weakref.proxy(llm_build_stats),
+        workspace=str(workspace),
+    )
+    built_engine_dir, _ = model_loader()
+    engine_dir.parent.mkdir(parents=True, exist_ok=True)
+    if engine_dir.exists():
+        shutil.rmtree(engine_dir)
+    shutil.copytree(built_engine_dir, engine_dir)
 
 
 @click.command(name="build")
@@ -307,6 +352,10 @@ def build_command(
                                max_num_tokens=max_num_tokens)
 
     build_config.plugin_config.dtype = model_config.dtype
+    if model_config.model_type in {"qwen3_5", "qwen3_next"}:
+        build_config.plugin_config.remove_input_padding = False
+        build_config.plugin_config.paged_state = False
+        build_config.plugin_config.mamba_conv1d_plugin = None
     # Enable multiple profiles and paged context FMHA.
     build_config.plugin_config.multiple_profiles = True
     # build_config.plugin_config._reduce_fusion = True
@@ -322,21 +371,20 @@ def build_command(
     if quant_algo == QuantAlgo.NVFP4:
         build_config.plugin_config.gemm_plugin = "nvfp4"
 
-    # Build the LLM engine with the LLMAPI.
-    llm = LLM(checkpoint_path,
-              tokenizer,
-              dtype=model_config.dtype,
-              tensor_parallel_size=tp_size,
-              pipeline_parallel_size=pp_size,
-              build_config=build_config,
-              quant_config=quant_config,
-              workspace=str(bench_env.workspace),
-              load_format=load_format,
-              trust_remote_code=trust_remote_code,
-              telemetry_config=bench_env.telemetry_config)
-    # Save the engine.
-    llm.save(engine_dir)
-    llm.shutdown()
+    build_engine_without_executor(
+        checkpoint_path=checkpoint_path,
+        tokenizer_path=checkpoint_path,
+        model_dtype=model_config.dtype,
+        tp_size=tp_size,
+        pp_size=pp_size,
+        build_config=build_config,
+        quant_config=quant_config,
+        workspace=bench_env.workspace,
+        engine_dir=engine_dir,
+        load_format=load_format,
+        trust_remote_code=trust_remote_code,
+        telemetry_config=bench_env.telemetry_config,
+    )
 
     logger.info(
         "\n===========================================================\n"

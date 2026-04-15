@@ -226,6 +226,10 @@ def update_quant_config_from_hf(quant_config, hf_config,
     return quant_config, override_fields
 
 
+def reject_unsupported_legacy_qwen_variants(hf_config) -> None:
+    del hf_config
+
+
 def args_to_build_options(args):
     return {
         'use_parallel_embedding': args.use_parallel_embedding,
@@ -251,7 +255,10 @@ def convert_and_save_hf(args):
                                                trust_remote_code=True)
         quant_config, override_fields = update_quant_config_from_hf(
             quant_config, hf_config, override_fields)
-    except:
+        reject_unsupported_legacy_qwen_variants(hf_config)
+    except Exception as exc:
+        if isinstance(exc, NotImplementedError):
+            raise
         logger.warning("AutoConfig cannot load the huggingface config.")
 
     if args.smoothquant is not None or args.int8_kv_cache:

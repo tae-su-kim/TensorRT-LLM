@@ -49,11 +49,13 @@
 #include "tensorrt_llm/plugins/eaglePlugin/eaglePrepareDrafterInputsPlugin.h"
 #include "tensorrt_llm/plugins/eaglePlugin/eagleSampleAndAcceptDraftTokensPlugin.h"
 #include "tensorrt_llm/plugins/fp4GemmPlugin/fp4GemmPlugin.h"
+#include "tensorrt_llm/plugins/gatedDeltaPlugin/gatedDeltaPlugin.h"
 #include "tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.h"
 #include "tensorrt_llm/plugins/lowLatencyGemmSwigluPlugin/lowLatencyGemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/qserveGemmPlugin/qserveGemmPlugin.h"
 #include "tensorrt_llm/plugins/quantizePerTokenPlugin/quantizePerTokenPlugin.h"
 #include "tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.h"
+#include "tensorrt_llm/plugins/qwenCausalConv1dPlugin/qwenCausalConv1dPlugin.h"
 #include "tensorrt_llm/plugins/rmsnormQuantizationPlugin/rmsnormQuantizationPlugin.h"
 #include "tensorrt_llm/plugins/selectiveScanPlugin/selectiveScanPlugin.h"
 #include "tensorrt_llm/plugins/smoothQuantGemmPlugin/smoothQuantGemmPlugin.h"
@@ -234,6 +236,8 @@ extern "C"
         static tensorrt_llm::plugins::WeightOnlyQuantMatmulPluginCreator weightOnlyQuantMatmulPluginCreator;
         static tensorrt_llm::plugins::LookupPluginCreator lookupPluginCreator;
         static tensorrt_llm::plugins::LoraPluginCreator loraPluginCreator;
+        static tensorrt_llm::plugins::GatedDeltaPluginCreator gatedDeltaPluginCreator;
+        static tensorrt_llm::plugins::QwenCausalConv1dPluginCreator qwenCausalConv1dPluginCreator;
         static tensorrt_llm::plugins::SelectiveScanPluginCreator selectiveScanPluginCreator;
         static tensorrt_llm::plugins::Fp4GemmPluginCreator fp4GemmPluginCreator;
         static tensorrt_llm::plugins::MambaConv1dPluginCreator mambaConv1DPluginCreator;
@@ -275,6 +279,8 @@ extern "C"
                   creatorPtr(weightOnlyQuantMatmulPluginCreator),
                   creatorPtr(lookupPluginCreator),
                   creatorPtr(loraPluginCreator),
+                  creatorPtr(gatedDeltaPluginCreator),
+                  creatorPtr(qwenCausalConv1dPluginCreator),
                   creatorPtr(selectiveScanPluginCreator),
                   creatorPtr(fp4GemmPluginCreator),
                   creatorPtr(mambaConv1DPluginCreator),

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -314,6 +314,7 @@ public:
     std::optional<TensorPtr>
         srcCacheIndirection;                     // [forwardBatchSize, maxBeamWidth, maxSeqLen], on gpu, for Beam Search
     std::optional<TensorConstPtr> embeddingBias; // [vocabSizePadded], on gpu
+    std::optional<TensorConstPtr> embeddingBiasMask; // [maxBatchSize], on cpu
     std::optional<TensorConstPtr> inputLengths;  // [maxBatchSize, maxBeamWidth], on gpu
     std::optional<TensorConstPtr> finished;      // [maxBatchSize, maxBeamWidth]
     std::optional<TensorPtr> curTokensPerStep;   // [maxBatchSize], on gpu

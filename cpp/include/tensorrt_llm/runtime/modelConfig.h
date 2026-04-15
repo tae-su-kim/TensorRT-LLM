@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -65,6 +65,13 @@ public:
         // NOTE: Linear and noop are attention alternatives introduced in Nemotron-NAS. They do not use the KV cache.
         kLINEAR,
         kNOOP,
+    };
+
+    enum class RecurrentStateMode : std::int32_t
+    {
+        kNone,
+        kPaged,
+        kDirect,
     };
 
     enum class KVCacheType : std::int32_t
@@ -406,11 +413,32 @@ public:
         mQuantMode = QuantMode;
     }
 
-    [[nodiscard]] bool constexpr supportsInflightBatching() const noexcept
+    [[nodiscard]] RecurrentStateMode getRecurrentStateMode() const noexcept
+    {
+        if (!isRnnBased())
+        {
+            return RecurrentStateMode::kNone;
+        }
+
+        return mPagedState ? RecurrentStateMode::kPaged : RecurrentStateMode::kDirect;
+    }
+
+    [[nodiscard]] bool usesPagedRecurrentState() const noexcept
+    {
+        return getRecurrentStateMode() == RecurrentStateMode::kPaged;
+    }
+
+    [[nodiscard]] bool usesDirectRecurrentState() const noexcept
+    {
+        return getRecurrentStateMode() == RecurrentStateMode::kDirect;
+    }
+
+    [[nodiscard]] bool supportsInflightBatching() const noexcept
     {
         return (isTransformerBased() && mUseGptAttentionPlugin && mInputPacked
                    && (mKVCacheType == KVCacheType::kDISABLED || mKVCacheType == KVCacheType::kPAGED))
-            || (isRnnBased() && mUseMambaConv1dPlugin && mInputPacked && mPagedState);
+            || (usesPagedRecurrentState() && mUseMambaConv1dPlugin && mInputPacked)
+            || usesDirectRecurrentState();
     }
 
     [[nodiscard]] SizeType32 constexpr getMaxBatchSize() const noexcept
@@ -780,9 +808,9 @@ public:
         mRnnConfig = rnnConfig;
     }
 
-    [[nodiscard]] bool constexpr isRnnBased() const noexcept
+    [[nodiscard]] bool isRnnBased() const noexcept
     {
-        return mModelVariant == ModelVariant::kMamba || mModelVariant == ModelVariant::kRecurrentGemma;
+        return mNbRnnLayers > 0;
     }
 
     [[nodiscard]] std::vector<LayerType> const& getLayerTypes() const noexcept

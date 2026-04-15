@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,6 +42,11 @@ class DecoderState;
 } // namespace decoder
 } // namespace tensorrt_llm::runtime
 
+namespace tensorrt_llm::batch_manager::rnn_state_manager
+{
+class DirectRnnStateManager;
+} // namespace tensorrt_llm::batch_manager::rnn_state_manager
+
 namespace tensorrt_llm::batch_manager
 {
 
@@ -52,6 +57,7 @@ class BaseKVCacheManager;
 
 class LlmRequest;
 
+class DirectRnnStateBuffers;
 class EncoderBuffers;
 class LoraBuffers;
 class MedusaBuffers;
@@ -128,6 +134,7 @@ private:
     SizeType32 numGenTokens{};
     SizeType32 numLogits{};
     SizeType32 maxKvCacheLengthRounded{};
+    SizeType32 maxInputLengthInBatch{1};
 
     //! General
     TensorPtr inputsIds;
@@ -170,6 +177,7 @@ public:
     //! Additional buffers depending on model type
     std::unique_ptr<TransformerBuffers> transformerBuffers;
     std::unique_ptr<RnnStateBuffers> rnnStateBuffers;
+    std::unique_ptr<DirectRnnStateBuffers> directRnnStateBuffers;
 
     //! Encoder-Decoder
     std::unique_ptr<EncoderBuffers> encoderBuffers;
@@ -275,12 +283,17 @@ public:
     std::tuple<SizeType32, TensorMap const&, TensorMap&> prepareStep(RequestVector const& contextRequests,
         RequestVector const& genRequests, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
         runtime::decoder::DecoderState const& decoderState, kv_cache_manager::BaseKVCacheManager* kvCacheManager,
-        kv_cache_manager::BaseKVCacheManager* crossKvCacheManager, rnn_state_manager::RnnStateManager* rnnStateManager,
-        PeftTable const& peftTable, runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
+        kv_cache_manager::BaseKVCacheManager* crossKvCacheManager,
+        rnn_state_manager::RnnStateManager* rnnStateManager,
+        rnn_state_manager::DirectRnnStateManager* directRnnStateManager, PeftTable const& peftTable,
+        runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
         OptionalRef<runtime::ITensor const> newOutputTokens = std::nullopt);
 
     void prepareBuffersForCudaGraph(SizeType32 maxSequenceLength);
+
+    void commitDirectRnnStateOutputs(
+        rnn_state_manager::DirectRnnStateManager* directRnnStateManager, runtime::TllmRuntime const& runtime);
 
     void prepareExplicitDraftTokenBuffers(runtime::ExplicitDraftTokensBuffers::Inputs const& explicitDraftTokensBuffers,
         runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
@@ -311,7 +324,8 @@ private:
         SizeType32 maxAttentionWindow, runtime::decoder::DecoderState const& decoderState,
         kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
         kv_cache_manager::BaseKVCacheManager* crossKvCacheManagerPtr,
-        rnn_state_manager::RnnStateManager* rnnStateManagerPtr, PeftTable const& peftTable,
+        rnn_state_manager::RnnStateManager* rnnStateManagerPtr,
+        rnn_state_manager::DirectRnnStateManager* directRnnStateManagerPtr, PeftTable const& peftTable,
         runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, bool trtOverlap, OptionalRef<runtime::ITensor const> newOutputTokens);
 

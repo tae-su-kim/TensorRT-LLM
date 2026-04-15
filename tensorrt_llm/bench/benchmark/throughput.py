@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
+import time
 from functools import partial
 from pathlib import Path
 
@@ -31,6 +33,172 @@ from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
+
+
+def _load_engine_config(engine_dir: Path) -> dict:
+    with open(engine_dir / "config.json", "r") as config_json:
+        return json.load(config_json)
+
+
+def _get_tensorrt_python_runtime_fallback_reason(
+        engine_dir: Path) -> str | None:
+    """Return the reason a TensorRT benchmark must use the Python runtime."""
+    engine_config = _load_engine_config(engine_dir)
+    layer_types = engine_config.get("pretrained_config", {}).get("layer_types",
+                                                                 [])
+    if "recurrent" not in layer_types:
+        return None
+    return None
+
+
+def _create_python_runtime_sampling_config(sampling_params: SamplingParams,
+                                           max_new_tokens: int):
+    from tensorrt_llm.runtime import SamplingConfig
+
+    sampling_config = SamplingConfig(
+        end_id=sampling_params.end_id,
+        pad_id=sampling_params.pad_id,
+    )
+    sampling_config.max_new_tokens = max_new_tokens
+    sampling_config.num_beams = sampling_params.n if sampling_params.use_beam_search else 1
+    sampling_config.output_sequence_lengths = True
+    sampling_config.return_dict = True
+
+    sampling_field_map = {
+        "top_k": "top_k",
+        "top_p": "top_p",
+        "top_p_min": "top_p_min",
+        "top_p_reset_ids": "top_p_reset_ids",
+        "top_p_decay": "top_p_decay",
+        "temperature": "temperature",
+        "repetition_penalty": "repetition_penalty",
+        "presence_penalty": "presence_penalty",
+        "frequency_penalty": "frequency_penalty",
+        "prompt_ignore_length": "prompt_ignore_length",
+        "length_penalty": "length_penalty",
+        "early_stopping": "early_stopping",
+        "min_p": "min_p",
+        "seed": "random_seed",
+        "min_tokens": "min_length",
+    }
+    for source_field, target_field in sampling_field_map.items():
+        value = getattr(sampling_params, source_field, None)
+        if value is not None:
+            setattr(sampling_config, target_field, value)
+
+    return sampling_config
+
+
+def _validate_python_runtime_requests(requests, modality: str | None) -> None:
+    if modality is not None:
+        raise RuntimeError(
+            "TensorRT Python runtime fallback does not support multimodal "
+            "requests.")
+
+    if any(request.is_multi_turn for request in requests):
+        raise RuntimeError(
+            "TensorRT Python runtime fallback does not support multi-turn "
+            "requests.")
+
+    if any(request.input_ids is None for request in requests):
+        raise RuntimeError(
+            "TensorRT Python runtime fallback requires tokenized text "
+            "requests with input_ids.")
+
+
+def _run_python_model_runner_benchmark(
+    *,
+    engine_dir: Path,
+    requests,
+    warmup_dataset,
+    sampling_params: SamplingParams,
+    concurrency: int,
+    modality: str | None,
+):
+    import torch
+
+    from tensorrt_llm._utils import EnergyMonitor
+    from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
+    from tensorrt_llm.runtime import ModelRunner
+
+    _validate_python_runtime_requests(requests, modality)
+    _validate_python_runtime_requests(warmup_dataset, modality)
+
+    engine_config = _load_engine_config(engine_dir)
+    world_size = engine_config.get("pretrained_config", {}).get(
+        "mapping", {}).get("world_size", 1)
+    runner = ModelRunner.from_dir(str(engine_dir))
+    effective_batch_size = runner.max_batch_size
+    if concurrency > 0:
+        effective_batch_size = min(effective_batch_size, concurrency)
+
+    def run_request_batch(request_batch, statistics: StatsKeeper | None) -> None:
+        grouped_requests = {}
+        for request in request_batch:
+            grouped_requests.setdefault(request.output_tokens, []).append(request)
+
+        for max_new_tokens, request_group in grouped_requests.items():
+            sampling_config = _create_python_runtime_sampling_config(
+                sampling_params, max_new_tokens)
+            batch_input_ids = [
+                torch.tensor(request.input_ids, dtype=torch.int32)
+                for request in request_group
+            ]
+            torch.cuda.synchronize()
+            request_start_timestamp = time.perf_counter_ns()
+            outputs = runner.generate(batch_input_ids=batch_input_ids,
+                                      sampling_config=sampling_config)
+            torch.cuda.synchronize()
+            response_end_timestamp = time.perf_counter_ns()
+
+            output_ids = outputs["output_ids"]
+            sequence_lengths = outputs["sequence_lengths"].reshape(
+                output_ids.shape[0], output_ids.shape[1])
+            for request_idx, request in enumerate(request_group):
+                tokens = []
+                generated_lengths = []
+                input_length = len(request.input_ids)
+                for beam_idx in range(output_ids.shape[1]):
+                    sequence_length = int(sequence_lengths[request_idx,
+                                                           beam_idx].item())
+                    generated_tokens = output_ids[
+                        request_idx, beam_idx, input_length:sequence_length
+                    ].tolist()
+                    tokens.extend(int(token) for token in generated_tokens)
+                    generated_lengths.append(len(generated_tokens))
+
+                if statistics is None:
+                    continue
+
+                statistics.register_request_perf_item(
+                    PerfItemTuple(
+                        start_timestamp=request_start_timestamp,
+                        end_timestamp=response_end_timestamp,
+                        request_id=request.task_id,
+                        num_input_tokens=input_length,
+                        response_is_final=True,
+                        error=False,
+                        tokens=tokens,
+                        decoding_iteration=max(max(generated_lengths) - 1, 0),
+                        time_on_first_token=None,
+                    ))
+
+    try:
+        for start_idx in range(0, len(warmup_dataset), effective_batch_size):
+            run_request_batch(
+                warmup_dataset[start_idx:start_idx + effective_batch_size],
+                statistics=None)
+
+        statistics = StatsKeeper()
+        with EnergyMonitor(world_size) as monitor:
+            for start_idx in range(0, len(requests), effective_batch_size):
+                run_request_batch(
+                    requests[start_idx:start_idx + effective_batch_size],
+                    statistics=statistics)
+        statistics.set_energy(monitor.total_energy)
+        return statistics
+    finally:
+        del runner
 
 
 @click.command(name="throughput")
@@ -431,8 +599,6 @@ def throughput_command(
         if bench_env.telemetry_config is not None:
             kwargs["telemetry_config"] = bench_env.telemetry_config
 
-        llm = get_llm(runtime_config, kwargs)
-
         sampler_args = {
             "end_id": options.eos_id,
             "pad_id": options.eos_id,
@@ -451,38 +617,67 @@ def throughput_command(
             logger.info("Multi-turn requests detected. Turns will be processed "
                         "sequentially within each request.")
 
-        # Perform warmup if requested.
+        warmup_dataset = []
         if options.warmup > 0:
             logger.info("Setting up for warmup...")
             warmup_dataset = generate_warmup_dataset(requests, options.warmup)
-            logger.info("Running warmup.")
-            asyncio.run(
-                async_benchmark(llm,
-                                sampling_params,
-                                post_proc_params,
-                                warmup_dataset,
-                                False,
-                                options.concurrency,
-                                modality=options.modality,
-                                tokenizer=multi_turn_tokenizer))
-            # WAR: IterationResult is a singleton tied to the executor.
-            # Since the benchmark calls asyncio.run() multiple times (e.g., during warmup),
-            # we must reset it to ensure it attaches to the correct event loop.
-            llm._executor._iter_stats_result = None
-            logger.info("Warmup done.")
 
-        iteration_writer = options.iteration_writer
-        with iteration_writer.capture():
-            statistics = asyncio.run(
-                async_benchmark(llm,
-                                sampling_params,
-                                post_proc_params,
-                                requests,
-                                options.streaming,
-                                options.concurrency,
-                                iteration_writer.full_address,
-                                modality=options.modality,
-                                tokenizer=multi_turn_tokenizer))
+        fallback_reason = None
+        if options.backend.lower() == "tensorrt":
+            fallback_reason = _get_tensorrt_python_runtime_fallback_reason(
+                options.engine_dir)
+
+        if fallback_reason is not None:
+            logger.warning(
+                f"{fallback_reason}. Falling back to TensorRT Python runtime for throughput benchmark."
+            )
+            if options.iteration_log is not None:
+                logger.warning(
+                    "Iteration logging is not supported in the TensorRT Python runtime fallback; skipping iteration_log."
+                )
+            logger.info("Running benchmark with TensorRT Python runtime.")
+            statistics = _run_python_model_runner_benchmark(
+                engine_dir=options.engine_dir,
+                requests=requests,
+                warmup_dataset=warmup_dataset,
+                sampling_params=sampling_params,
+                concurrency=options.concurrency,
+                modality=options.modality,
+            )
+        else:
+            llm = get_llm(runtime_config, kwargs)
+
+            # Perform warmup if requested.
+            if warmup_dataset:
+                logger.info("Running warmup.")
+                asyncio.run(
+                    async_benchmark(llm,
+                                    sampling_params,
+                                    post_proc_params,
+                                    warmup_dataset,
+                                    False,
+                                    options.concurrency,
+                                    modality=options.modality,
+                                    tokenizer=multi_turn_tokenizer))
+                # WAR: IterationResult is a singleton tied to the executor.
+                # Since the benchmark calls asyncio.run() multiple times
+                # (e.g., during warmup), we must reset it to ensure it
+                # attaches to the correct event loop.
+                llm._executor._iter_stats_result = None
+                logger.info("Warmup done.")
+
+            iteration_writer = options.iteration_writer
+            with iteration_writer.capture():
+                statistics = asyncio.run(
+                    async_benchmark(llm,
+                                    sampling_params,
+                                    post_proc_params,
+                                    requests,
+                                    options.streaming,
+                                    options.concurrency,
+                                    iteration_writer.full_address,
+                                    modality=options.modality,
+                                    tokenizer=multi_turn_tokenizer))
 
         logger.info("Benchmark done. Reporting results...")
         if options.modality is not None:

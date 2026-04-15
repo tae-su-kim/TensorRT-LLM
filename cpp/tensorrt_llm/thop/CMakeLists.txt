@@ -35,8 +35,8 @@ target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
                                       ${CURAND_LIB})
 
 # TODO This does not compile with internal cutlass MOE gemm
-add_library(
-  th_common SHARED
+set(
+  TH_COMMON_SRCS
   mlaPreprocessOp.cpp
   allgatherOp.cpp
   allreduceOp.cpp
@@ -47,7 +47,6 @@ add_library(
   cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
-  cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
   cudaScaledMM.cpp
   dynamicDecodeOp.cpp
@@ -116,6 +115,12 @@ add_library(
   fusedGemmAllreduceOp.cpp
   convertReqIndexToGlobalOp.cpp
   trtllmGenQKVProcessOp.cpp)
+
+if(ENABLE_CUBLASLT_FP4_GEMM)
+  list(APPEND TH_COMMON_SRCS cublasFp4ScaledMM.cpp)
+endif()
+
+add_library(th_common SHARED ${TH_COMMON_SRCS})
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}

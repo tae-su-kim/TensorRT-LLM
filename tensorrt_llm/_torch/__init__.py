@@ -1,3 +1,8 @@
-from .llm import LLM
+import os
 
-__all__ = ["LLM"]
+if os.getenv("TRT_LLM_MINIMAL_IMPORT", "0") == "1":
+    __all__ = []
+else:
+    from .llm import LLM
+
+    __all__ = ["LLM"]

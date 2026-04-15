@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +16,19 @@ from . import utils
 from .mode import (KV_CACHE_QUANT_ALGO_LIST, MODELOPT_FLOW_QUANTIZATIONS,
                    QUANT_ALGO_LIST, W8A8_SQ_PLUGIN_LIST, GroupwiseQuantAlgo,
                    QuantAlgo, QuantMode)
-from .quantize_by_modelopt import quantize_and_export, quantize_nemo_and_export
+
+
+def quantize_and_export(*args, **kwargs):
+    from .quantize_by_modelopt import quantize_and_export as _quantize_and_export
+
+    return _quantize_and_export(*args, **kwargs)
+
+
+def quantize_nemo_and_export(*args, **kwargs):
+    from .quantize_by_modelopt import (
+        quantize_nemo_and_export as _quantize_nemo_and_export)
+
+    return _quantize_nemo_and_export(*args, **kwargs)
 
 __all__ = [
     'QUANT_ALGO_LIST', 'KV_CACHE_QUANT_ALGO_LIST', 'W8A8_SQ_PLUGIN_LIST',

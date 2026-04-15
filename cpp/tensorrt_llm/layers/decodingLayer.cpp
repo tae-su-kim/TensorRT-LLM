@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -169,16 +169,27 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         TLLM_CHECK_WITH_INFO(localDecoderDomain.getBeamWidth() == 1,
             "Decoding mode is TopK and/or TopP, but beamWidth != 1 (%d != 1)", localDecoderDomain.getBeamWidth());
 
-        // In sampling, we have supported batch sampling. So, we always compute all
-        // sentences once.
-        TensorConstPtr logitsSlice = ITensor::slice(*params->logits, 0, localBatchSize);
         TensorConstPtr endIdSlice = ITensor::slice(endIds, 0, localBatchSize);
         auto decodeInputs = std::make_shared<SamplingInputs>(endIdSlice, params->batchSlots, step, ite, localBatchSize);
 
         decodeInputs->finished = params->finished;
-
-        decodeInputs->logits = logitsSlice;
-
+        if (params->logits)
+        {
+            // In sampling, we have supported batch sampling. So, we always compute all
+            // sentences once.
+            decodeInputs->logits = ITensor::slice(*params->logits, 0, localBatchSize);
+        }
+        else if (params->logitsVec)
+        {
+            TLLM_CHECK_WITH_INFO(params->logitsVec->size() == static_cast<size_t>(localBatchSize),
+                "Logits vector size (%zu) does not match local batch size (%ld)", params->logitsVec->size(),
+                localBatchSize);
+            decodeInputs->logitsVec = params->logitsVec.value();
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(false, "Neither logits nor logitsVec are set for sampling decode");
+        }
         if (params->inputLengths)
         {
             auto& inputLengths = params->inputLengths.value();
