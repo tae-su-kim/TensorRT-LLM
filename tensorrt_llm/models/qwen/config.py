@@ -256,6 +256,7 @@ class QWenConfig(PretrainedConfig):
                     "Qwen3.5 config is missing required linear attention "
                     f"fields: {missing_fields}")
             layer_types = _normalize_qwen3_5_layer_types(layer_types)
+            state_dtype = dtype if dtype in ('bfloat16', 'float16') else 'float32'
             qwen3_5_recurrent_kwargs = {
                 'conv_kernel':
                 linear_conv_kernel_dim,
@@ -269,7 +270,7 @@ class QWenConfig(PretrainedConfig):
                 'state_size':
                 linear_key_head_dim,
                 'state_dtype':
-                'float32',
+                state_dtype,
             }
 
         moe_config = MoeConfig(num_experts=moe_num_experts,

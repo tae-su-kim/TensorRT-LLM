@@ -17,7 +17,278 @@ limitations under the License.
 
 # Work Status
 
-Updated: 2026-04-15
+Updated: 2026-04-16
+
+## Executive Summary
+
+- Goal:
+  - bring up `Qwen/Qwen3.5-0.8B` on the legacy TensorRT backend native C++ executor path
+  - benchmark it against `vLLM`
+  - identify the highest-value remaining optimization targets
+- What we have done:
+  - enabled and iterated on the TensorRT recurrent path for Qwen3.5
+  - added and benchmarked multiple recurrent-side optimizations:
+    - fused `GatedDelta` plugin
+    - decode-specialized recurrent path
+    - FlashInfer prefill fast path
+    - FlashInfer-style decode fast path
+    - TensorRT-side `g` / `beta` computation cleanup
+    - decode greedy / penalty-skip runtime fast path
+  - updated the Qwen3.5 TensorRT config path so recurrent `state_dtype` follows model dtype for `bfloat16` /
+    `float16`
+  - fixed the local rebuild path by replacing stale repo-native libraries with a consistent rebuilt native set
+- Best kept TensorRT baseline today:
+  - engine: `/tmp/qwen35_native_bench_engine_bs64_qwen_update_conv`
+  - mixed `1024 -> 1024`: `14793.09` tok/s
+  - decode-heavy `1 -> 1024`: `16468.63` tok/s
+  - prefill-heavy `1024 -> 1`: `0.403s`
+- Best kept gap vs `vLLM`:
+  - mixed: TensorRT is `14.5%` slower
+  - decode-heavy: TensorRT is `7.0%` slower
+  - prefill-heavy: TensorRT is `15.5%` lower latency
+- Current repo-native rebuild status:
+  - the rebuild path is working again
+  - a fresh repo-native engine can now be rebuilt reproducibly from the current checkout
+  - that fresh direct-state-write rebuild regressed:
+    - mixed: `10619.18` tok/s
+    - decode-heavy: `11698.87` tok/s
+    - prefill-heavy: `0.411s`
+  - it is therefore not a replacement for the current kept TensorRT baseline
+- Practical conclusion:
+  - the next priority is not more Qwen-only conv tuning
+  - the next priority is to recover the missing high-throughput decode runtime path in a clean repo-native rebuild
+
+## Reproducibility
+
+### Reproducibility Scope
+
+- There are two useful environments to reproduce:
+  - the current kept TensorRT performance baseline for comparison against `vLLM`
+  - the current repo-native rebuild path from source, which is reproducible but slower
+- Use the kept baseline when you want to rerun the strongest local TensorRT-vs-vLLM comparison.
+- Use the repo-native rebuild path when you want to validate source changes or rebuild the engine from the current
+  checkout.
+
+### Hardware And Software Assumptions
+
+- GPU: `1x H100 80GB`
+- Repo root: `/workspace/TensorRT-LLM`
+- TensorRT / main Python env: `/venv/main`
+- vLLM Python env: `/venv/vllm`
+- HF snapshot used in all current controls:
+  - `/workspace/.hf_home/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17`
+
+### Local Artifact Paths
+
+- Working kept TensorRT baseline package root:
+  - `/tmp/qwen35_native_pkg`
+- Working kept TensorRT baseline engine:
+  - `/tmp/qwen35_native_bench_engine_bs64_qwen_update_conv`
+- Lean repo-native build tree:
+  - `/tmp/trtllm_qwen35_native_build4`
+- Rebuilt repo-native staged package root:
+  - `/tmp/qwen35_native_pkg_repo_directstate`
+- Fresh repo-native rebuilt engine:
+  - `/tmp/qwen35_native_bench_engine_bs64_directstate`
+- Build config used for bs64 rebuild:
+  - `/tmp/qwen35_build_config_bs64_qwen_update_conv.json`
+- Checkpoint used for bf16-state rebuild:
+  - `/tmp/qwen35_native_bench_ckpt_bf16_state`
+- Synthetic datasets:
+  - mixed `128 x 1024 -> 1024`: `/tmp/qwen35_bench_dataset_128x1024_1024.jsonl`
+  - decode-heavy `128 x 1 -> 1024`: `/tmp/qwen35_bench_dataset_128x1_1024.jsonl`
+  - prefill-heavy `128 x 1024 -> 1`: `/tmp/qwen35_bench_dataset_128x1024_1.jsonl`
+
+### Required Environment Variables
+
+- Always set:
+  - `HWLOC_COMPONENTS=-gl`
+- For local TensorRT rebuild / runtime bring-up:
+  - `TLLM_DISABLE_MPI=1`
+- For staged repo-native package import:
+  - `TRT_LLM_MINIMAL_IMPORT=1`
+  - `PYTHONPATH=/tmp/qwen35_native_pkg_repo_directstate`
+  - `LD_LIBRARY_PATH=/tmp/qwen35_native_pkg_repo_directstate/tensorrt_llm/libs:/venv/main/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}`
+
+### Reproduce The Kept TensorRT Baseline
+
+- This is the easiest way to rerun the strongest local TensorRT-vs-vLLM comparison.
+- Use the current checked-in `nsys` harness:
+
+```bash
+cd /workspace/TensorRT-LLM
+HWLOC_COMPONENTS=-gl TLLM_DISABLE_MPI=1 /venv/main/bin/python \
+  scripts/profile_qwen35_nsys.py \
+  --backend tensorrt \
+  --backend vllm \
+  --workload mixed \
+  --workload decode_heavy \
+  --workload prefill_heavy \
+  --engine-dir /tmp/qwen35_native_bench_engine_bs64_qwen_update_conv \
+  --tensorrt-package-root /tmp/qwen35_native_pkg \
+  --output-dir /tmp/qwen35_nsys_profiles_compare_trt_vllm_repro_20260416
+```
+
+- Source-of-truth kept baseline reports on disk:
+  - mixed TensorRT: `/tmp/qwen35_qwen_update_conv_mixed_inner_report.json`
+  - decode-heavy TensorRT: `/tmp/qwen35_qwen_update_conv_decode_inner_report.json`
+  - prefill-heavy TensorRT: `/tmp/qwen35_qwen_update_conv_prefill_inner_report.json`
+  - mixed vLLM: `/tmp/qwen35_vllm_bs64_bench_report.json`
+  - decode-heavy vLLM: `/tmp/qwen35_vllm_decode_heavy_report.json`
+  - prefill-heavy vLLM: `/tmp/qwen35_vllm_prefill_heavy_report.json`
+
+### Reproduce The Repo-Native Rebuild Path
+
+#### 1. Rebuild Native Libraries
+
+- Reuse the lean `sm90` build tree:
+
+```bash
+cmake --build /tmp/trtllm_qwen35_native_build4 \
+  --target nvinfer_plugin_tensorrt_llm tensorrt_llm th_common bindings \
+  -j 8
+```
+
+- The current build tree is already configured against the repo checkout at `/workspace/TensorRT-LLM/cpp`.
+- If it must be recreated from scratch, use `/tmp/trtllm_qwen35_native_build4/CMakeCache.txt` as the source of truth.
+- Important current cache characteristics:
+  - `CMAKE_CUDA_ARCHITECTURES=90`
+  - `BUILD_PYT=ON`
+  - `BUILD_TESTS=OFF`
+  - `BUILD_BENCHMARKS=OFF`
+  - `BUILD_DEEP_EP=OFF`
+  - `BUILD_DEEP_GEMM=OFF`
+  - `BUILD_FLASH_MLA=ON`
+  - `BUILD_CONTEXT_FMHA=ON`
+  - `BUILD_DECODER_ATTENTION=ON`
+  - `FAST_BUILD=ON`
+
+#### 2. Create The Staged Repo-Native Package Overlay
+
+- Build the staged runtime package by overlaying current repo Python sources on top of the known-good package root and
+  replacing the stale native libraries with the freshly rebuilt ones:
+
+```bash
+rm -rf /tmp/qwen35_native_pkg_repo_directstate
+cp -a /tmp/qwen35_native_pkg /tmp/qwen35_native_pkg_repo_directstate
+rsync -a --exclude='*.so' --exclude='libs/' \
+  /workspace/TensorRT-LLM/tensorrt_llm/ \
+  /tmp/qwen35_native_pkg_repo_directstate/tensorrt_llm/
+cp /tmp/trtllm_qwen35_native_build4/tensorrt_llm/nanobind/bindings.cpython-312-x86_64-linux-gnu.so \
+  /tmp/qwen35_native_pkg_repo_directstate/tensorrt_llm/
+cp /tmp/trtllm_qwen35_native_build4/tensorrt_llm/thop/libth_common.so \
+  /tmp/qwen35_native_pkg_repo_directstate/tensorrt_llm/
+cp /tmp/trtllm_qwen35_native_build4/tensorrt_llm/thop/libth_common.so \
+  /tmp/qwen35_native_pkg_repo_directstate/tensorrt_llm/libs/libth_common.so
+cp /tmp/trtllm_qwen35_native_build4/tensorrt_llm/libtensorrt_llm.so \
+  /tmp/qwen35_native_pkg_repo_directstate/tensorrt_llm/libs/libtensorrt_llm.so
+cp /tmp/trtllm_qwen35_native_build4/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so \
+  /tmp/qwen35_native_pkg_repo_directstate/tensorrt_llm/libs/libnvinfer_plugin_tensorrt_llm.so
+cp /tmp/trtllm_qwen35_native_build4/tensorrt_llm/runtime/utils/libpg_utils.so \
+  /tmp/qwen35_native_pkg_repo_directstate/tensorrt_llm/libs/libpg_utils.so
+```
+
+#### 3. Smoke-Test The Staged Package
+
+```bash
+cd /tmp
+PYTHONPATH=/tmp/qwen35_native_pkg_repo_directstate \
+LD_LIBRARY_PATH=/tmp/qwen35_native_pkg_repo_directstate/tensorrt_llm/libs:/venv/main/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH} \
+TRT_LLM_MINIMAL_IMPORT=1 TLLM_DISABLE_MPI=1 HWLOC_COMPONENTS=-gl \
+/venv/main/bin/python -u - <<'PY'
+import tensorrt_llm.bindings
+from tensorrt_llm.plugin.plugin import _load_plugin_lib
+from tensorrt_llm.builder import BuildConfig
+_load_plugin_lib()
+print("staged repo-native import ok")
+PY
+```
+
+#### 4. Build The Fresh Repo-Native Engine
+
+```bash
+cd /tmp
+rm -rf /tmp/qwen35_native_bench_engine_bs64_directstate
+mkdir -p /tmp/qwen35_native_bench_engine_bs64_directstate
+PYTHONPATH=/tmp/qwen35_native_pkg_repo_directstate \
+LD_LIBRARY_PATH=/tmp/qwen35_native_pkg_repo_directstate/tensorrt_llm/libs:/venv/main/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH} \
+HWLOC_COMPONENTS=-gl TLLM_DISABLE_MPI=1 TRT_LLM_MINIMAL_IMPORT=1 \
+/venv/main/bin/python -u - <<'PY'
+from pathlib import Path
+import torch
+from tensorrt_llm.builder import BuildConfig
+from tensorrt_llm.commands.build import build_model
+from tensorrt_llm.models import PretrainedConfig
+from tensorrt_llm.plugin.plugin import _load_plugin_lib
+
+torch.cuda.set_device(0)
+_load_plugin_lib()
+
+out_dir = Path("/tmp/qwen35_native_bench_engine_bs64_directstate")
+ckpt_dir = Path("/tmp/qwen35_native_bench_ckpt_bf16_state")
+cache_path = out_dir / "model.cache"
+
+build_config = BuildConfig.from_json_file("/tmp/qwen35_build_config_bs64_qwen_update_conv.json")
+build_config.input_timing_cache = str(cache_path) if cache_path.exists() else None
+build_config.output_timing_cache = str(cache_path)
+
+model_config = PretrainedConfig.from_json_file(ckpt_dir / "config.json")
+engine = build_model(
+    build_config,
+    rank=0,
+    ckpt_dir=str(ckpt_dir),
+    model_config=model_config,
+    logits_dtype=None,
+    use_fused_mlp=True,
+    lora_dir=None,
+    lora_ckpt_source="hf",
+    max_lora_rank=64,
+    lora_target_modules=None,
+    strip_plan=False,
+    refit=False,
+)
+engine.save(str(out_dir))
+print(sorted(p.name for p in out_dir.iterdir()))
+PY
+```
+
+- Expected outputs:
+  - `config.json`
+  - `model.cache`
+  - `rank0.engine`
+
+#### 5. Benchmark The Fresh Repo-Native Engine
+
+- Source-of-truth current report files:
+  - mixed: `/tmp/qwen35_cpp_native_mixed_directstate_report.json`
+  - decode-heavy: `/tmp/qwen35_cpp_native_decode_heavy_directstate_report.json`
+  - prefill-heavy: `/tmp/qwen35_cpp_native_prefill_heavy_directstate_report.json`
+- If you need `nsys` on the fresh repo-native engine, reuse the checked-in harness with the staged package root:
+
+```bash
+cd /workspace/TensorRT-LLM
+HWLOC_COMPONENTS=-gl TLLM_DISABLE_MPI=1 /venv/main/bin/python \
+  scripts/profile_qwen35_nsys.py \
+  --backend tensorrt \
+  --workload mixed \
+  --workload decode_heavy \
+  --workload prefill_heavy \
+  --engine-dir /tmp/qwen35_native_bench_engine_bs64_directstate \
+  --tensorrt-package-root /tmp/qwen35_native_pkg_repo_directstate \
+  --output-dir /tmp/qwen35_nsys_profiles_trt_directstate_20260416
+```
+
+### Reproducibility Pitfalls
+
+- If the builder cannot find `QwenCausalConv1d`, the repo-native plugin library is stale.
+  - Rebuild `/tmp/trtllm_qwen35_native_build4` and recreate `/tmp/qwen35_native_pkg_repo_directstate`.
+- If `bindings` import fails with an undefined `c10::MessageLogger` symbol, the staged package is mixing old and new
+  native libraries.
+  - Recreate the staged package overlay from scratch.
+- If `build_model()` succeeds but the engine directory only contains `model.cache`, you forgot to call:
+  - `engine.save(output_dir)`
+- If `vLLM` is launched from stdin and crashes with `/tmp/<stdin>` under multiprocessing spawn, use a file-backed
+  script instead of a heredoc.
 
 ## Qwen3.5 Findings
 
@@ -29,23 +300,20 @@ Updated: 2026-04-15
 
 ### Current Status
 
-- Native C++ TensorRT executor now works for `Qwen3.5` through the new direct recurrent-state path.
-- A fused TensorRT-side `GatedDelta` plugin is implemented and enabled for `qwen3_5`.
-- A decode-specialized `GatedDelta` plugin path is now integrated and serialized into a fresh bs64 engine.
-- A FlashInfer-backed prefill fast path is now integrated into the legacy `GatedDelta` plugin for pure-context
-  batches.
-- A FlashInfer-style pure-decode fast path is now integrated into the legacy `GatedDelta` plugin for pure decode
-  batches, using the same K-last recurrent state layout as the prefill path.
-- The plugin contract now computes `g` and `beta` inside the TensorRT plugin/runtime path instead of materializing
-  them in the TensorRT graph.
-- TensorRT-side correctness smoke passes for both:
-  - context-style recurrent execution
-  - decode-style recurrent execution
-- The current benchmark engines are:
-  - `/tmp/qwen35_native_bench_engine_bs64_decodeopt`
-  - `/tmp/qwen35_native_bench_engine_bs64_flashinfer_prefill`
-  - `/tmp/qwen35_native_bench_engine_bs64_flashinfer_decode`
-  - `/tmp/qwen35_native_bench_engine_bs64_gating_cleanup`
+- Native C++ TensorRT execution for `Qwen3.5` is working.
+- The kept high-watermark TensorRT baseline is still:
+  - `/tmp/qwen35_native_bench_engine_bs64_qwen_update_conv`
+- The fresh repo-native rebuild path is also working again:
+  - build tree: `/tmp/trtllm_qwen35_native_build4`
+  - staged package root: `/tmp/qwen35_native_pkg_repo_directstate`
+  - rebuilt engine: `/tmp/qwen35_native_bench_engine_bs64_directstate`
+- The strongest validated TensorRT improvements so far remain:
+  - fused `GatedDelta`
+  - FlashInfer prefill integration
+  - decode runtime greedy / penalty-skip fast path
+- The fresh repo-native direct-state-write conv rebuild did not beat either:
+  - the kept TensorRT baseline
+  - `vLLM`
 
 ### Environment Notes
 
@@ -55,6 +323,112 @@ Updated: 2026-04-15
   deserialization:
   - `from tensorrt_llm.plugin.plugin import _load_plugin_lib`
   - `_load_plugin_lib()`
+
+### 2026-04-15 Rebaseline
+
+- The earlier TensorRT-vs-vLLM comparison in this file was stale for the main Qwen3.5 path because the local
+  `nsys` harness defaulted to the older engine `/tmp/qwen35_native_bench_engine_bs64_inkernel_qk`.
+- The current kept TensorRT baseline is now:
+  - engine: `/tmp/qwen35_native_bench_engine_bs64_qwen_update_conv`
+  - harness default updated in `scripts/profile_qwen35_nsys.py`
+- Fresh current-control reports on that engine:
+  - mixed `1024 -> 1024`: `/tmp/qwen35_qwen_update_conv_mixed_inner_report.json`
+  - decode-heavy `1 -> 1024`: `/tmp/qwen35_qwen_update_conv_decode_inner_report.json`
+  - prefill-heavy `1024 -> 1`: `/tmp/qwen35_qwen_update_conv_prefill_inner_report.json`
+- Matching current vLLM controls:
+  - mixed: `/tmp/qwen35_vllm_bs64_bench_report.json`
+  - decode-heavy: `/tmp/qwen35_vllm_decode_heavy_report.json`
+  - prefill-heavy: `/tmp/qwen35_vllm_prefill_heavy_report.json`
+
+### Current Gap Vs vLLM
+
+All results below are single-H100 offline throughput at `128` requests and `batch size 64`.
+
+#### Mixed workload: `1024 in / 1024 out`
+
+- TensorRT native `qwen_update_conv`: `14793.09` output tok/s
+  - elapsed: `8.860s`
+- vLLM: `16936.33` output tok/s
+  - elapsed: `7.739s`
+- Gap:
+  - `vLLM / TensorRT = 1.145x`
+  - `vLLM` is about `14.5%` faster on this control
+
+#### Decode-heavy workload: `1 in / 1024 out`
+
+- TensorRT native `qwen_update_conv`: `16468.63` requested output tok/s
+  - elapsed: `7.959s`
+- vLLM: `17625.09` output tok/s
+  - elapsed: `7.437s`
+- Gap:
+  - `vLLM / TensorRT = 1.070x`
+  - `vLLM` is about `7.0%` faster on this control
+
+#### Prefill-heavy workload: `1024 in / 1 out`
+
+- TensorRT native `qwen_update_conv` elapsed: `0.403s`
+- vLLM elapsed: `0.477s`
+- Gap:
+  - TensorRT latency is about `15.5%` lower than `vLLM` on this control
+
+### Current Decode Targets
+
+- The remaining performance gap is no longer prefill-dominated. Pure prefill is already competitive or better than
+  `vLLM` on this workload.
+- The highest-value remaining decode-side targets from the current `nsys` trace are:
+  - GEMM kernels: `28.7%` of timed decode-heavy GPU kernel time
+  - `qwenGatedDeltaDecodeKernel`: `27.2%`
+  - `kernel_mha`: `9.3%`
+  - fused GEMM tail: `7.5%`
+  - `causal_conv1d_update_kernel`: `3.4%`
+  - post-recurrent helper chain (`__myl_*` kernels): about `6-7%` combined
+- Timed decode-heavy memcpy breakdown is still mostly `Device-to-Device`:
+  - `81.7%` D2D
+  - `9.8%` H2D
+  - `7.9%` D2H
+
+### Local Code Changes Landed
+
+- `scripts/profile_qwen35_nsys.py`
+  - default TensorRT engine updated to `/tmp/qwen35_native_bench_engine_bs64_qwen_update_conv`
+  - default workload map now includes `prefill_heavy`
+- `tensorrt_llm/models/qwen/config.py`
+  - Qwen3.5 recurrent `state_dtype` now follows the model dtype for `bfloat16` / `float16` models instead of being
+    hard-pinned to `float32`
+- `tests/unittest/trt/model/test_qwen.py`
+  - Qwen3.5 config expectation updated to reflect the new `bfloat16` default on the current HF config fixture
+- Local native-kernel prototype also staged:
+  - direct write of Qwen conv final state in `causalConv1d.cu`
+  - removal of the plugin-side pre-copy in `qwenCausalConv1dPlugin`
+  - this still needs a fresh native rebuild and benchmark before it should be treated as a validated improvement
+
+### Historical Rebuild Blocker
+
+- The earlier local rebuild blocker is now resolved.
+- The actual root causes were:
+  - stale repo-native libraries that did not register `QwenCausalConv1d`
+  - an older staged package whose `libth_common.so` / `bindings` pair was built against a different `torch` ABI
+- The resolved path is:
+  - rebuild native libraries in `/tmp/trtllm_qwen35_native_build4`
+  - recreate `/tmp/qwen35_native_pkg_repo_directstate`
+  - rebuild the engine from that staged package
+- The rebuilt repo-native path is reproducible, but the resulting direct-state-write engine is slower than the current
+  kept TensorRT baseline.
+
+### Closest Existing bf16-State Evidence
+
+- The nearest previously built `bf16`-state engines already on disk are older than the current `qwen_update_conv`
+  baseline:
+  - mixed: `/tmp/qwen35_cpp_native_executor_bs64_bench_bf16_state_report.json`
+    - `8909.39` requested output tok/s
+  - decode-heavy: `/tmp/qwen35_cpp_native_decode_heavy_report_bf16_state.json`
+    - `9750.26` requested output tok/s
+- Those older `bf16`-state artifacts are slower than the current `qwen_update_conv` baseline, so they should not be
+  used as the final answer for the current path.
+- The practical conclusion is:
+  - changing recurrent state dtype alone is not enough to beat `vLLM`
+  - the real remaining upside is still in the current decode kernel path and its surrounding GEMM / helper tail
+  - the staged direct-state-write conv change should be re-benchmarked once the local build path is working again
 
 ### End-to-End Throughput
 
@@ -525,3 +899,94 @@ All results below are for `1024/1024`, single GPU, offline throughput.
   - decode attention path quality
   - shared GEMM/helper fragmentation
   - avoid more Qwen-only graph/plugin rewrites unless the shared-path options are exhausted
+
+## 2026-04-16 Direct-State-Write Rebuild
+
+- Rebuilt a fresh repo-native binary set from the current checkout using the lean `sm90` build tree:
+  - build tree: `/tmp/trtllm_qwen35_native_build4`
+  - rebuilt artifacts:
+    - `libtensorrt_llm.so`
+    - `libnvinfer_plugin_tensorrt_llm.so`
+    - `libth_common.so`
+    - `bindings.cpython-312-x86_64-linux-gnu.so`
+- Staged those rebuilt binaries together with the current repo Python sources in:
+  - `/tmp/qwen35_native_pkg_repo_directstate`
+- Built a fresh bs64 engine from that staged package:
+  - engine: `/tmp/qwen35_native_bench_engine_bs64_directstate`
+
+### Rebuild Notes
+
+- The earlier local rebuild blocker is resolved.
+- Root causes were:
+  - the repo checkout had stale native libraries that did not register `QwenCausalConv1d`
+  - the older staged package carried a `libth_common.so` / `bindings` pair built against a different `torch` ABI
+- The fresh build from `/tmp/trtllm_qwen35_native_build4` fixed both issues and produced a clean engine build and runtime load path.
+
+### Results
+
+- Fresh repo-native direct-state-write engine reports:
+  - mixed `1024 -> 1024`: `/tmp/qwen35_cpp_native_mixed_directstate_report.json`
+  - decode-heavy `1 -> 1024`: `/tmp/qwen35_cpp_native_decode_heavy_directstate_report.json`
+  - prefill-heavy `1024 -> 1`: `/tmp/qwen35_cpp_native_prefill_heavy_directstate_report.json`
+
+#### Mixed workload: `1024 in / 1024 out`
+
+- Fresh repo-native direct-state-write engine:
+  - `10619.18` output tok/s
+  - elapsed: `12.343s`
+- Current kept TensorRT baseline:
+  - `14793.09` output tok/s
+  - elapsed: `8.860s`
+- vLLM control:
+  - `16936.33` output tok/s
+  - elapsed: `7.739s`
+- Delta:
+  - vs kept TensorRT baseline: `-28.2%`
+  - vs `vLLM`: `-37.3%`
+
+#### Decode-heavy workload: `1 in / 1024 out`
+
+- Fresh repo-native direct-state-write engine:
+  - `11698.87` output tok/s
+  - elapsed: `11.204s`
+- Current kept TensorRT baseline:
+  - `16468.63` output tok/s
+  - elapsed: `7.959s`
+- vLLM control:
+  - `17625.09` output tok/s
+  - elapsed: `7.437s`
+- Delta:
+  - vs kept TensorRT baseline: `-29.0%`
+  - vs `vLLM`: `-33.6%`
+
+#### Prefill-heavy workload: `1024 in / 1 out`
+
+- Fresh repo-native direct-state-write engine:
+  - elapsed: `0.411s`
+- Current kept TensorRT baseline:
+  - elapsed: `0.403s`
+- vLLM control:
+  - elapsed: `0.477s`
+- Delta:
+  - vs kept TensorRT baseline latency: `+2.2%`
+  - vs `vLLM` latency: `-13.7%`
+
+### Outcome
+
+- This implementation did not outperform `vLLM`.
+- It also did not match the current kept TensorRT baseline.
+- The direct-state-write conv change is therefore not a candidate replacement for the current kept path in its present repo-native form.
+
+### Interpretation
+
+- The fresh repo-native rebuild behaves much closer to the older pre-penalty-skip / pre-fastpath TensorRT points than to the kept `qwen_update_conv` control.
+- Inference:
+  - the stronger kept local TensorRT point still depends on native/runtime behavior that is not being reproduced by the current repo-native rebuild path
+  - further Qwen-only conv-side optimization is lower priority than recovering the missing decode-side runtime fast path in a clean rebuildable form
+
+### Next Targets
+
+- Reconcile the repo-native decoder runtime against the kept high-throughput local package, with focus on:
+  - greedy / no-penalty sampling fast path engagement
+  - penalty-path bypass on the batched `logitsVec` native runtime path
+  - decode-side GEMM / helper fragmentation after the runtime fast path is restored

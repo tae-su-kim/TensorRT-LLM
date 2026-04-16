@@ -48,10 +48,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = Path(
     "/workspace/.hf_home/hub/models--Qwen--Qwen3.5-0.8B/snapshots/"
     "2fc06364715b967f1860aea9cf38778875588b17")
-DEFAULT_ENGINE_DIR = Path("/tmp/qwen35_native_bench_engine_bs64_inkernel_qk")
+DEFAULT_ENGINE_DIR = Path("/tmp/qwen35_native_bench_engine_bs64_qwen_update_conv")
 DEFAULT_DATASETS = {
     "decode_heavy": Path("/tmp/qwen35_bench_dataset_128x1_1024.jsonl"),
     "mixed": Path("/tmp/qwen35_bench_dataset_128x1024_1024.jsonl"),
+    "prefill_heavy": Path("/tmp/qwen35_bench_dataset_128x1024_1.jsonl"),
 }
 DEFAULT_OUTPUT_DIR = Path("/tmp/qwen35_nsys_profiles")
 DEFAULT_BATCH_SIZE = 64

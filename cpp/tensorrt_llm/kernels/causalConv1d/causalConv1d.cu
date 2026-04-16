@@ -445,6 +445,17 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
     int cache_seqlen = kIsCircularBuffer ? params.cache_seqlens[batch_id] % state_len : 0;
     int update_idx = cache_seqlen - (kWidth - 1);
     update_idx = update_idx < 0 ? update_idx + state_len : update_idx;
+    bool const useSeparateStateBuffers = !kIsCircularBuffer && params.initial_states_ptr != nullptr
+        && params.final_states_ptr != nullptr && state_len == kWidth - 1;
+    input_t const* initial_state = nullptr;
+    input_t* final_state = nullptr;
+    if (useSeparateStateBuffers)
+    {
+        initial_state = reinterpret_cast<input_t const*>(params.initial_states_ptr)
+            + conv_state_batch_coord * params.initial_states_batch_stride + channel_id * params.initial_states_c_stride;
+        final_state = reinterpret_cast<input_t*>(params.final_states_ptr)
+            + conv_state_batch_coord * params.final_states_batch_stride + channel_id * params.final_states_c_stride;
+    }
 
     float weight_vals[kWidth] = {0};
 #pragma unroll
@@ -454,7 +465,15 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
     }
 
     float x_vals[kWidth] = {0};
-    if constexpr (!kIsCircularBuffer)
+    if (useSeparateStateBuffers)
+    {
+#pragma unroll
+        for (int i = 0; i < kWidth - 1; ++i)
+        {
+            x_vals[i] = float(initial_state[i * params.initial_states_l_stride]);
+        }
+    }
+    else if constexpr (!kIsCircularBuffer)
     {
 #pragma unroll 2
         for (int i = 0; i < state_len - advance_len - (kWidth - 1); ++i)
@@ -486,7 +505,7 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
     for (int i = 0; i < params.seqlen; ++i)
     {
         input_t x_val = x[i * params.x_l_stride];
-        if constexpr (!kIsCircularBuffer)
+        if (!useSeparateStateBuffers && !kIsCircularBuffer)
         {
             if (i < advance_len && state_len - advance_len + i >= 0)
             {
@@ -516,6 +535,15 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
         for (int i = 0; i < kWidth - 1; ++i)
         {
             x_vals[i] = x_vals[i + 1];
+        }
+    }
+
+    if (useSeparateStateBuffers)
+    {
+#pragma unroll
+        for (int i = 0; i < kWidth - 1; ++i)
+        {
+            final_state[i * params.final_states_l_stride] = input_t(x_vals[i]);
         }
     }
 }

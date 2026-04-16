@@ -135,7 +135,7 @@ def test_qwen3_5_config_from_hf_normalizes_composite_config(mock_from_pretrained
     assert config.rnn_head_size == 128
     assert config.rnn_conv_dim_size == 1280
     assert config.state_size == 128
-    assert config.state_dtype == "float32"
+    assert config.state_dtype == "bfloat16"
 
 
 def test_qwen3_5_architecture_is_registered_in_model_map():

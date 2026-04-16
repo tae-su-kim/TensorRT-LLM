@@ -100,9 +100,9 @@ size_t QwenCausalConv1dPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const
 }
 
 void QwenCausalConv1dPlugin::setCommonParams(ConvParamsBase& params, int batchSize, int seqLen, void const* input,
-    void* convState, void const* weight, void* output) const
+    void const* inputState, void* outputState, void const* weight, void* output) const
 {
-    std::memset(&params, 0, sizeof(params));
+    params = {};
 
     params.batch = batchSize;
     params.dim = mDim;
@@ -127,11 +127,19 @@ void QwenCausalConv1dPlugin::setCommonParams(ConvParamsBase& params, int batchSi
     params.out_c_stride = 1;
     params.out_l_stride = mDim;
 
-    params.conv_state_ptr = convState;
+    params.conv_state_ptr = outputState;
     params.conv_state_len = mWidth - 1;
     params.conv_state_batch_stride = mDim * (mWidth - 1);
     params.conv_state_c_stride = mWidth - 1;
     params.conv_state_l_stride = 1;
+    params.initial_states_ptr = const_cast<void*>(inputState);
+    params.initial_states_batch_stride = mDim * (mWidth - 1);
+    params.initial_states_c_stride = mWidth - 1;
+    params.initial_states_l_stride = 1;
+    params.final_states_ptr = outputState;
+    params.final_states_batch_stride = mDim * (mWidth - 1);
+    params.final_states_c_stride = mWidth - 1;
+    params.final_states_l_stride = 1;
 }
 
 template <typename T>
@@ -141,16 +149,9 @@ int QwenCausalConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputD
     int const batchSize = static_cast<int>(inputDesc[getInputTensorIdx()].dims.d[0]);
     int const seqLen = static_cast<int>(inputDesc[getInputTensorIdx()].dims.d[1]);
 
-    size_t const stateBytes = static_cast<size_t>(batchSize) * mDim * (mWidth - 1) * sizeof(T);
-    if (inputs[getConvStateIdx()] != outputs[1])
-    {
-        check_cuda_error(cudaMemcpyAsync(
-            outputs[1], inputs[getConvStateIdx()], stateBytes, cudaMemcpyDeviceToDevice, stream));
-    }
-
     ConvParamsBase params{};
-    setCommonParams(params, batchSize, seqLen, inputs[getInputTensorIdx()], outputs[1], inputs[getWeightIdx()],
-        outputs[0]);
+    setCommonParams(params, batchSize, seqLen, inputs[getInputTensorIdx()], inputs[getConvStateIdx()], outputs[1],
+        inputs[getWeightIdx()], outputs[0]);
     causal_conv1d_update_cuda<T, T>(params, stream);
 
     sync_check_cuda_error(stream);

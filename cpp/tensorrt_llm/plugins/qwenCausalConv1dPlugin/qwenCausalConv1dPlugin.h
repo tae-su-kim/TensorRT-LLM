@@ -80,8 +80,8 @@ private:
         return 2;
     }
 
-    void setCommonParams(ConvParamsBase& params, int batchSize, int seqLen, void const* input, void* convState,
-        void const* weight, void* output) const;
+    void setCommonParams(ConvParamsBase& params, int batchSize, int seqLen, void const* input, void const* inputState,
+        void* outputState, void const* weight, void* output) const;
 
 private:
     int mDim;
