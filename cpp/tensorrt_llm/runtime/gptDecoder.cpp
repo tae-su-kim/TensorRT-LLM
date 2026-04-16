@@ -35,6 +35,54 @@ using BufferPtr = IBuffer::SharedPtr;
 using TensorConstPtr = ITensor::SharedConstPtr;
 using TensorPtr = ITensor::SharedPtr;
 
+namespace
+{
+
+template <typename T>
+TensorConstPtr maybePackContiguousLogits(std::vector<TensorConstPtr> const& logitsVec)
+{
+    if (logitsVec.empty())
+    {
+        return nullptr;
+    }
+
+    auto const& firstLogits = logitsVec.front();
+    auto const& firstShape = firstLogits->getShape();
+    if (firstShape.nbDims != 3)
+    {
+        return nullptr;
+    }
+
+    auto const dtype = firstLogits->getDataType();
+    auto const memoryType = firstLogits->getMemoryType();
+    auto const logitsElementsPerBatch = ITensor::volumeNonNegative(firstShape);
+    auto const* expectedPtr = bufferCastOrNull<T>(firstLogits);
+    if (expectedPtr == nullptr)
+    {
+        return nullptr;
+    }
+
+    for (auto const& logits : logitsVec)
+    {
+        if (logits->getDataType() != dtype || logits->getMemoryType() != memoryType || !logits->shapeEquals(firstShape))
+        {
+            return nullptr;
+        }
+        if (bufferCastOrNull<T>(logits) != expectedPtr)
+        {
+            return nullptr;
+        }
+        expectedPtr += logitsElementsPerBatch;
+    }
+
+    auto packedLogits = ITensor::view(firstLogits,
+        ITensor::makeShape({static_cast<ITensor::DimType64>(logitsVec.size()), firstShape.d[0], firstShape.d[1],
+            firstShape.d[2]}));
+    return TensorConstPtr{packedLogits.release()};
+}
+
+} // namespace
+
 template <typename T>
 GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxNumSequences, size_t maxBeamWidth,
     size_t vocabSize, size_t vocabSizePadded, CudaStreamPtr const& stream,
@@ -476,7 +524,14 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
         {
             TLLM_CHECK(logits->getDataType() == TRTDataType<T>::value);
         }
-        forwardParams->logitsVec = input.logitsVec;
+        if (auto packedLogits = maybePackContiguousLogits<T>(input.logitsVec))
+        {
+            forwardParams->logits = std::move(packedLogits);
+        }
+        else
+        {
+            forwardParams->logitsVec = input.logitsVec;
+        }
     }
 
     if (input.embeddingBias)
